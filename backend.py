@@ -3232,6 +3232,51 @@ def _mid_report_path_quality_guard_reason(
                     and float(upper_wick_atr_5m) <= 0.35
                 )
             )
+
+            # v58: hard clean-path / late-pump WAIT guards.  A detected setup is only
+            # an idea until the entry has a clean road to TP1.  LONG under a seller
+            # reaction or in the upper 25-30% of the local range after a pump must wait
+            # for real acceptance/expansion instead of emitting immediately.
+            try:
+                v58_clean_path_guard = str(os.getenv("MID_V58_CLEAN_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                v58_clean_path_guard = True
+            try:
+                v58_clean_path_max_tp_pct = float(os.getenv("MID_V58_CLEAN_PATH_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
+            except Exception:
+                v58_clean_path_max_tp_pct = 0.035
+            try:
+                v58_late_pump_min_atr = float(os.getenv("MID_V58_LATE_PUMP_MIN_ATR", "0.90") or 0.90)
+            except Exception:
+                v58_late_pump_min_atr = 0.90
+            try:
+                v58_upper_range_pos = float(os.getenv("MID_V58_LONG_UPPER_RANGE_POS", "0.70") or 0.70)
+            except Exception:
+                v58_upper_range_pos = 0.70
+            if (
+                v58_clean_path_guard
+                and level_before_tp1
+                and no_accept
+                and clean_space_pct <= float(v58_clean_path_max_tp_pct)
+                and not real_bull_continuation
+            ):
+                return (
+                    f"quality_path_clean_path_long_wall_wait:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                    f"|range_pos={float(rpos):.2f}|accept=0|body_atr={bv:.2f}|vol={rv:.2f}"
+                )
+            if (
+                v58_clean_path_guard
+                and late_from_low >= float(v58_late_pump_min_atr)
+                and float(rpos) >= float(v58_upper_range_pos)
+                and no_accept
+                and clean_space_pct <= float(v58_clean_path_max_tp_pct)
+                and not real_bull_continuation
+            ):
+                return (
+                    f"quality_path_late_long_upper_range_wait:side=LONG|clean={clean_space_pct*100:.2f}%"
+                    f"|late_atr={late_from_low:.2f}|range_pos={float(rpos):.2f}|accept=0"
+                )
+
             if review_guard_v55:
                 # User-reviewed LOSS pattern: LONG under local high / resistance,
                 # TP1 behind seller reaction, no acceptance.  Do not block real
@@ -3441,7 +3486,66 @@ def _mid_report_path_quality_guard_reason(
                     f"|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}|fast={int(bool(fast_continuation_ok))}"
                 )
 
-            if strong_accept or fast_continuation_ok:
+            # v57: Structure pending is only a saved idea until the market proves the
+            # location.  It must not emit as a live LONG in the upper range / under a
+            # seller wall just because the trigger fired.  Wait for acceptance above
+            # resistance or a true fast-continuation breakout.
+            try:
+                sp_accept_guard = str(os.getenv("MID_V57_STRUCTURE_PENDING_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                sp_accept_guard = True
+            try:
+                sp_accept_max_tp_pct = float(os.getenv("MID_V57_STRUCTURE_PENDING_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
+            except Exception:
+                sp_accept_max_tp_pct = 0.035
+            try:
+                sp_accept_late_atr = float(os.getenv("MID_V57_STRUCTURE_PENDING_LATE_ATR", "0.75") or 0.75)
+            except Exception:
+                sp_accept_late_atr = 0.75
+            try:
+                sp_require_2close = str(os.getenv("MID_V58_STRUCTURE_PENDING_REQUIRE_2_CLOSES", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                sp_require_2close = True
+            # We do not always have exact historical "two closes above wall" fields, so
+            # two green candles + higher lows is used as a conservative proxy.  It keeps
+            # the setup in pending until the market proves acceptance and fresh expansion.
+            sp_two_close_proxy_bull = bool(two_green_now and higher_lows_now)
+            sp_fresh_expansion_bull = bool(
+                (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v > 0)
+                and float(close_pos_5m) >= 0.68
+                and not bool(two_red_now)
+                and float(upper_wick_atr_5m) <= 0.35
+            )
+            sp_accept_ok_for_emit_long = bool(
+                strict_bull_acceptance
+                and sp_fresh_expansion_bull
+                and ((not sp_require_2close) or sp_two_close_proxy_bull)
+            )
+            sp_wait_for_long_acceptance = bool(
+                sp_accept_guard
+                and structure_pending_route
+                and clean_space_pct <= float(sp_accept_max_tp_pct)
+                and not sp_accept_ok_for_emit_long
+                and not bool(fast_continuation_ok)
+                and (
+                    no_accept
+                    or level_before_tp1
+                    or tp1_blocked
+                    or near_level
+                    or local_top_bad
+                    or range_bad
+                    or pulled_back_from_local_high
+                    or late_from_low >= float(sp_accept_late_atr)
+                )
+            )
+            if sp_wait_for_long_acceptance:
+                return (
+                    f"quality_path_structure_pending_wait_acceptance:side=LONG|clean={clean_space_pct*100:.2f}%"
+                    f"|late_atr={late_from_low:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
+                    f"|level={level_name}|accept=0|fast={int(bool(fast_continuation_ok))}"
+                )
+
+            if fast_continuation_ok or (strong_accept and (not structure_pending_route or bool(locals().get("sp_accept_ok_for_emit_long", False)))):
                 return ""
             # v53: weak fresh_momentum_ok alone is not enough to pass old Structure
             # pending when TP1 is small and price is still below a local seller wall.
@@ -3576,6 +3680,50 @@ def _mid_report_path_quality_guard_reason(
                 and float(lower_wick_atr_5m) <= 0.35
             )
         )
+
+        # v58 mirror: do not SHORT directly above buyer reaction / support, and do
+        # not sell the lower 25-30% of the local range after a dump without breakdown
+        # acceptance.  Keep the idea pending until the support is accepted below.
+        try:
+            v58_clean_path_guard = str(os.getenv("MID_V58_CLEAN_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            v58_clean_path_guard = True
+        try:
+            v58_clean_path_max_tp_pct = float(os.getenv("MID_V58_CLEAN_PATH_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
+        except Exception:
+            v58_clean_path_max_tp_pct = 0.035
+        try:
+            v58_late_dump_min_atr = float(os.getenv("MID_V58_LATE_DUMP_MIN_ATR", "0.90") or 0.90)
+        except Exception:
+            v58_late_dump_min_atr = 0.90
+        try:
+            v58_lower_range_pos = float(os.getenv("MID_V58_SHORT_LOWER_RANGE_POS", "0.30") or 0.30)
+        except Exception:
+            v58_lower_range_pos = 0.30
+        if (
+            v58_clean_path_guard
+            and level_before_tp1
+            and no_accept
+            and clean_space_pct <= float(v58_clean_path_max_tp_pct)
+            and not real_bear_continuation
+        ):
+            return (
+                f"quality_path_clean_path_short_wall_wait:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                f"|range_pos={float(rpos):.2f}|accept=0|body_atr={bv:.2f}|vol={rv:.2f}"
+            )
+        if (
+            v58_clean_path_guard
+            and late_from_high >= float(v58_late_dump_min_atr)
+            and float(rpos) <= float(v58_lower_range_pos)
+            and no_accept
+            and clean_space_pct <= float(v58_clean_path_max_tp_pct)
+            and not real_bear_continuation
+        ):
+            return (
+                f"quality_path_late_short_lower_range_wait:side=SHORT|clean={clean_space_pct*100:.2f}%"
+                f"|late_atr={late_from_high:.2f}|range_pos={float(rpos):.2f}|accept=0"
+            )
+
         if review_guard_v55:
             # User-reviewed LOSS pattern: SHORT too low / above support after dump,
             # TP1 behind buyer reaction, no breakdown acceptance.  Strong bearish
@@ -3659,7 +3807,80 @@ def _mid_report_path_quality_guard_reason(
                 f"|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
             )
 
-        if strong_accept or fresh_momentum_ok or fast_continuation_ok:
+        # v57 mirror: Structure pending / BOS retest SHORT must wait for breakdown
+        # acceptance below support.  A trigger above support is only a saved idea, not
+        # a live emit.
+        try:
+            structure_pending_route = bool("structure" in route_s or "pending" in route_s or "normal_pending" in route_s or "bos" in route_s or "retest" in route_s)
+        except Exception:
+            structure_pending_route = False
+        try:
+            sp_accept_guard = str(os.getenv("MID_V57_STRUCTURE_PENDING_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            sp_accept_guard = True
+        try:
+            sp_accept_max_tp_pct = float(os.getenv("MID_V57_STRUCTURE_PENDING_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
+        except Exception:
+            sp_accept_max_tp_pct = 0.035
+        try:
+            sp_accept_late_atr = float(os.getenv("MID_V57_STRUCTURE_PENDING_LATE_ATR", "0.75") or 0.75)
+        except Exception:
+            sp_accept_late_atr = 0.75
+        strict_bear_acceptance = bool(
+            strong_accept
+            or (
+                level_value > 0
+                and close < (level_value - pad_abs)
+                and float(close_pos_5m) <= 0.30
+                and not bool(two_green_now)
+                and float(lower_wick_atr_5m) <= 0.25
+                and (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v < 0)
+            )
+        )
+        pulled_back_from_local_low = bool(recent_low > 0 and recent_low < entry and pullback_from_low_atr >= 0.08)
+        try:
+            sp_require_2close = str(os.getenv("MID_V58_STRUCTURE_PENDING_REQUIRE_2_CLOSES", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            sp_require_2close = True
+        sp_two_close_proxy_bear = bool(two_red_now and lower_highs_now)
+        sp_fresh_expansion_bear = bool(
+            (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v < 0)
+            and float(close_pos_5m) <= 0.32
+            and not bool(two_green_now)
+            and float(lower_wick_atr_5m) <= 0.35
+        )
+        sp_accept_ok_for_emit_short = bool(
+            strict_bear_acceptance
+            and sp_fresh_expansion_bear
+            and ((not sp_require_2close) or sp_two_close_proxy_bear)
+        )
+        sp_wait_for_short_acceptance = bool(
+            sp_accept_guard
+            and structure_pending_route
+            and clean_space_pct <= float(sp_accept_max_tp_pct)
+            and not sp_accept_ok_for_emit_short
+            and not bool(fast_continuation_ok)
+            and (
+                no_accept
+                or level_before_tp1
+                or tp1_blocked
+                or near_level
+                or local_bottom_bad
+                or range_bad
+                or pulled_back_from_local_low
+                or late_from_high >= float(sp_accept_late_atr)
+            )
+        )
+        if sp_wait_for_short_acceptance:
+            return (
+                f"quality_path_structure_pending_wait_breakdown:side=SHORT|clean={clean_space_pct*100:.2f}%"
+                f"|late_atr={late_from_high:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
+                f"|level={level_name}|accept=0|fast={int(bool(fast_continuation_ok))}"
+            )
+
+        if fast_continuation_ok or (strong_accept and (not structure_pending_route or bool(locals().get("sp_accept_ok_for_emit_short", False)))):
+            return ""
+        if fresh_momentum_ok and not structure_pending_route:
             return ""
         if dump_rejection:
             return (
@@ -3709,6 +3930,35 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
+def _mid_is_waitable_final_emit_reason(reason: str) -> bool:
+    """Reasons that mean: keep the setup alive, do not emit yet.
+
+    v57 quality-first behavior: a premature trigger is not a final rejection.
+    If the idea is structurally alive but the entry is still under resistance / above
+    support / too far from the anchor, pending should keep waiting for acceptance.
+    Terminal reasons such as directional contradiction or structure_broken are not waitable.
+    """
+    try:
+        r = str(reason or "").strip().lower()
+    except Exception:
+        return False
+    if not r:
+        return False
+    if "directional_contradiction" in r or "structure_broken" in r or "invalidation_hit" in r or "trend_flip" in r:
+        return False
+    return (
+        r.startswith("quality_path")
+        or r.startswith("quality_guard")
+        or r.startswith("tp1_blocked")
+        or r.startswith("no_clean_path")
+        or r.startswith("sl_inside_pullback")
+        or r.startswith("late_from_anchor")
+        or r.startswith("late_entry")
+        or r.startswith("anti_bounce")
+        or r.startswith("macd_hist")
+    )
+
+
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -3734,6 +3984,40 @@ def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | 
             except Exception:
                 pass
         risk = abs(entry - sl)
+
+        # v57: do not emit oversized 5m/15m FUTURES risks.  These are usually not
+        # scalps anymore (TRUMP-like case: ~5.5% SL and ~7.7% TP1) and should stay
+        # pending/wait for a better re-entry instead of being sent as a live signal.
+        try:
+            oversized_guard = str(os.getenv("MID_V57_OVERSIZED_RISK_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            oversized_guard = True
+        if oversized_guard and entry > 0 and risk > 0:
+            try:
+                market_u = str(market or "").upper().strip()
+            except Exception:
+                market_u = ""
+            try:
+                tf_s = str(getattr(sig, "timeframe", "") or (ta or {}).get("timeframe") or (it or {}).get("timeframe") or "").lower()
+            except Exception:
+                tf_s = ""
+            is_fast_tf = (not tf_s) or ("5m" in tf_s) or ("15m" in tf_s)
+            sl_pct = risk / max(float(entry), 1e-12)
+            tp1_pct = (abs(float(tp1) - float(entry)) / max(float(entry), 1e-12)) if tp1 > 0 else 0.0
+            if market_u == "FUTURES" and is_fast_tf:
+                try:
+                    max_fut_sl = float(os.getenv("MID_V57_FUTURES_MAX_SL_5M_PCT", "2.50") or 2.50) / 100.0
+                except Exception:
+                    max_fut_sl = 0.025
+                try:
+                    max_fut_tp1 = float(os.getenv("MID_V57_FUTURES_MAX_TP1_5M_PCT", "4.00") or 4.00) / 100.0
+                except Exception:
+                    max_fut_tp1 = 0.040
+                if sl_pct > max_fut_sl:
+                    return f"quality_path_oversized_futures_sl_wait:sl_pct={sl_pct*100:.2f}%>{max_fut_sl*100:.2f}%|tp1_pct={tp1_pct*100:.2f}%"
+                if tp1_pct > max_fut_tp1:
+                    return f"quality_path_oversized_futures_tp1_wait:tp1_pct={tp1_pct*100:.2f}%>{max_fut_tp1*100:.2f}%|sl_pct={sl_pct*100:.2f}%"
+
         min_risk = _mid_min_stop_distance(entry, atr, ta, it)
         if entry > 0 and risk > 0 and min_risk > 0 and risk + 1e-12 < min_risk:
             return f"sl_too_tight:{risk / max(min_risk, 1e-12):.2f}x"
@@ -9539,6 +9823,14 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     WEAKNESS_NEG_HITS = _env_int_mid("SMART_WEAKNESS_NEG_HITS", 1, is_mid)
                     WEAKNESS_MIN_RETAIN_PCT = _env_float_mid("SMART_WEAKNESS_MIN_RETAIN_PCT", 0.05, is_mid)
 
+                    # v57 no-progress time stop: do not let MID scalps sit for hours
+                    # without threatening TP1.  This targets TRUMP-like losses where a
+                    # 5m idea stayed open too long with no expansion.
+                    NO_PROGRESS_EXIT_ENABLED = (os.getenv("SMART_NO_PROGRESS_EXIT_ENABLED", "1" if is_mid else "0").strip().lower() not in ("0","false","no","off"))
+                    NO_PROGRESS_MIN_AGE_SEC = _env_float_mid("SMART_NO_PROGRESS_MIN_AGE_SEC", 30.0 * 60.0, is_mid)
+                    NO_PROGRESS_MIN_BEST_TP1_PROGRESS = _env_float_mid("SMART_NO_PROGRESS_MIN_BEST_TP1_PROGRESS", 0.35, is_mid)
+                    NO_PROGRESS_MAX_LOSS_PCT = _env_float_mid("SMART_NO_PROGRESS_MAX_LOSS_PCT", 0.85, is_mid)
+
                     # Post-entry invalidation BEFORE SL (allows early exit in a small loss / tiny profit)
                     INVALIDATION_EXIT_ENABLED = (os.getenv("SMART_INVALIDATION_EXIT_ENABLED", "1" if is_mid else "0").strip().lower() not in ("0","false","no","off"))
                     INVALIDATION_MIN_BARS = _env_int_mid("SMART_INVALIDATION_MIN_5M_BARS", 1, is_mid)
@@ -10047,6 +10339,61 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         else:
                             fail_reason = _sm_reason_execution_error(weakness_close_error or last_close_explain or _sm_reason_close_returned_false())
                             await _notify_smart_decision("WEAKNESS", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=fail_reason, cooldown_sec=15.0)
+
+                    if NO_PROGRESS_EXIT_ENABLED and is_mid and entry_p > 0 and tp1 > 0 and (not tp1_seen):
+                        try:
+                            if direction == "LONG":
+                                best_progress_live = (float(best_px) - float(entry_p)) / max(float(tp1) - float(entry_p), 1e-12)
+                                loss_now_live = max(0.0, (1.0 - float(px) / max(float(entry_p), 1e-12)) * 100.0)
+                            else:
+                                best_progress_live = (float(entry_p) - float(best_px)) / max(float(entry_p) - float(tp1), 1e-12)
+                                loss_now_live = max(0.0, (float(px) / max(float(entry_p), 1e-12) - 1.0) * 100.0)
+                            best_progress_live = max(0.0, min(2.0, float(best_progress_live)))
+                        except Exception:
+                            best_progress_live = 0.0
+                            loss_now_live = 0.0
+                        no_progress_due = bool(
+                            float(open_age_sec or 0.0) >= float(NO_PROGRESS_MIN_AGE_SEC)
+                            and best_progress_live < float(NO_PROGRESS_MIN_BEST_TP1_PROGRESS)
+                            and float(loss_now_live) <= float(NO_PROGRESS_MAX_LOSS_PCT)
+                        )
+                        if no_progress_due:
+                            no_progress_err = ""
+                            no_progress_reason = (
+                                f"No-progress time stop: age={float(open_age_sec or 0.0)/60.0:.1f}m, "
+                                f"best_progress_to_TP1={best_progress_live:.2f}R < {float(NO_PROGRESS_MIN_BEST_TP1_PROGRESS):.2f}R, "
+                                f"loss_now={float(loss_now_live):.2f}%"
+                            )
+                            close_ok = False
+                            try:
+                                close_ok = await _close_market(qty)
+                            except Exception as e:
+                                no_progress_err = str(e)
+                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] no-progress close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
+                            if close_ok:
+                                await _notify_smart_decision(
+                                    "TIME",
+                                    "CLOSED",
+                                    level_label="TP1",
+                                    level_price=tp1 if tp1 > 0 else px,
+                                    reason=_sm_join_reason(no_progress_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)),
+                                    cooldown_sec=5.0,
+                                )
+                                await _mark_local_full_close("NO_PROGRESS_TIME_STOP", tp1_hit=False)
+                                pnl_usdt, roi_percent = _smart_close_snapshot()
+                                await db_store.close_autotrade_position(
+                                    user_id=uid,
+                                    signal_id=r.get("signal_id"),
+                                    exchange=ex,
+                                    market_type=mt,
+                                    status="CLOSED",
+                                    pnl_usdt=pnl_usdt,
+                                    roi_percent=roi_percent,
+                                    row_id=int(r.get("id") or 0),
+                                )
+                                continue
+                            else:
+                                await _notify_smart_decision("TIME", "NOT CLOSED", level_label="TP1", level_price=tp1 if tp1 > 0 else px, reason=_sm_reason_execution_error(no_progress_err or last_close_explain or _sm_reason_close_returned_false()), cooldown_sec=15.0)
 
                     invalidation_eval = None
                     if INVALIDATION_EXIT_ENABLED and is_mid and mt == "futures" and entry_p > 0 and (not tp1_seen):
@@ -13805,7 +14152,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # Toggle:
         #   MID_PENDING_ENABLED=1
         #   MID_PENDING_SKIP_HARDBLOCKS=1   (default)
-        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
         _pending_skip_hb = os.getenv("MID_PENDING_SKIP_HARDBLOCKS", "1").strip().lower() not in ("0", "false", "no", "off")
         # When user wants *all* filters only after setup, we skip all hardblocks during the SCAN phase.
         # On TRIGGER phase we must enforce the filters again.
@@ -16982,7 +17329,7 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
         if not _mid_bool_env("MID_SCAN_HARDBLOCK_RSI_ADX", "1"):
             return None
 
-        if not (_mid_bool_env("MID_PENDING_ENABLED", "0") and _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")):
+        if not (_mid_bool_env("MID_PENDING_ENABLED", "1") and _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")):
             return None
 
         try:
@@ -18019,7 +18366,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         use_bort = _mid_bool_env("MID_USE_BREAKOUT_RETEST", "1")
         use_ob = _mid_bool_env("MID_USE_ORDER_BLOCK", "1")
         require_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER", "1")
-        pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "0")
+        pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "1")
         postsetup_only = _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")
 
         if use_regime:
@@ -18648,7 +18995,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         if contradiction_reason:
             contradiction_block_reason = str(contradiction_reason)
             try:
-                _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+                _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
                 _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                 _phase_now = str(_phase or "scan").lower()
                 _defer_to_trigger = bool(_pending_enabled and _postsetup_only and _phase_now == "scan")
@@ -18864,7 +19211,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mkt_u2 = str(market or "SPOT").upper()
         min_score = int(os.getenv("MID_MIN_SCORE_SPOT", "76")) if mkt_u2 == "SPOT" else int(os.getenv("MID_MIN_SCORE_FUTURES", "72"))
         if min_score > 0 and int(confidence) < int(min_score):
-            _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+            _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
             _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
             _phase = "scan"
             try:
@@ -25700,7 +26047,7 @@ async def _mid_get_active_trade(self, symbol: str, market: str = "") -> dict | N
         return None
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
-    enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+    enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
     if not enabled:
         return
     poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
@@ -25816,6 +26163,22 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         """
         r0 = str(reason or "fail").strip().lower()
 
+        # v57 quality-first pending: if the trigger fired too early (under resistance,
+        # above support, too far from anchor, etc.), do NOT consume the setup as a
+        # failed signal. Keep it alive and wait for a cleaner acceptance/entry point.
+        try:
+            if str(os.getenv("MID_V57_QUALITY_GUARD_KEEP_PENDING", "1") or "1").strip().lower() in ("1", "true", "yes", "on") and _mid_is_waitable_final_emit_reason(str(reason or "")):
+                it["last_fail_reason"] = str(reason or "quality_wait")
+                it["last_fail_ts"] = float(now_ts)
+                it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
+                it["quality_wait_ts"] = float(now_ts)
+                _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
+                if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
+                    _pending_clear_cooldown(it)
+                    return (False, "hard_fail")
+                return (True, "wait")
+        except Exception:
+            pass
 
         # Special case: direction_mismatch is *soft* by default (only used on strong reversals).
         # This can be disabled to let it fall back to the generic soft/hard lists.
@@ -25858,7 +26221,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,quality_guard,late_entry,macd_hist,anti_bounce").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
@@ -30516,7 +30879,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             # Railway env is a common source of "it should be 1 but behaves like 0" issues.
             # Log the effective flags and key thresholds once per tick.
             try:
-                pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
+                pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "1") or "0").strip().lower() not in ("0","false","no","off")
                 postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "1") or "0").strip().lower() not in ("0","false","no","off")
                 require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
                 min_conf = 0  # confidence filter removed permanently
@@ -32591,7 +32954,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         best_name, best_r = chosen_name, chosen_r
                         base_r = best_r
                         # Mode switch: create setups first, apply filters later at trigger.
-                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
                         postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                         scan_soft = bool(pending_enabled and postsetup_only)
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
@@ -33003,7 +33366,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         ts=time.time(),
                         )
                         # If MID_PENDING_ENABLED=1: save setup and emit ONLY when price reaches entry + TA reconfirmed.
-                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0","false","no","off")
                         if pending_enabled:
                             try:
                                 # Normalize direction/market (avoid Enum-ish strings like 'Direction.SHORT')
