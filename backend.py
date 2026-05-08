@@ -26030,6 +26030,72 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 if not ok_guard:
                     removed += 1
                     continue
+
+                # v62: do not let old pending records created by older policy versions
+                # live forever. Pending is only for early/temporary waits. Terminal
+                # reasons are purged at load, and waitable records expire by a
+                # shorter waitable age rather than the generic long TTL.
+                try:
+                    if str(os.getenv("MID_PENDING_PURGE_POLICY_ON_LOAD", "1") or "1").strip().lower() in ("1", "true", "yes", "on"):
+                        _reason_blob = " | ".join([
+                            str(it.get("pending_wait_reason") or ""),
+                            str(it.get("last_fail_reason") or ""),
+                            str(it.get("pending_kill_policy") or ""),
+                            str(it.get("pending_wait_policy") or ""),
+                            str(it.get("pending_early_policy") or ""),
+                        ])
+                        _rk, _rp = _mid_pending_reason_policy(_reason_blob) if _reason_blob.strip() else (True, "no_policy_reason")
+                        # Explicit hard/terminal kill reasons should remove old zombie pending.
+                        if _reason_blob.strip() and (not _rk) and str(_rp or "").startswith("kill:") and str(_rp) not in ("kill:not_waitable", "kill:policy_error"):
+                            removed += 1
+                            continue
+
+                        # If this is a waitable clean-path/acceptance pending, require it
+                        # to still be an early-save candidate and respect the shorter
+                        # waitable lifetime.
+                        if _reason_blob.strip() and bool(_rk):
+                            _ek, _en = _mid_pending_is_early_save_candidate(it, _reason_blob, _rp)
+                            if not _ek:
+                                removed += 1
+                                continue
+                            try:
+                                _age_m2 = max(0.0, (float(now_ts) - float(created_ts or now_ts)) / 60.0)
+                            except Exception:
+                                _age_m2 = 0.0
+                            try:
+                                _mkt2 = str(it.get("market") or "").upper().strip()
+                                _max_age2 = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN", "35") if _mkt2 == "FUTURES" else os.getenv("MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN", "45"))
+                            except Exception:
+                                _max_age2 = 45.0
+                            if _max_age2 > 0 and _age_m2 >= _max_age2:
+                                removed += 1
+                                continue
+
+                        # Legacy pendings without v61 early marker but already old are
+                        # removed unless they are clearly a fresh BO/RT or structure-pending idea.
+                        if not str(it.get("pending_early_policy") or "").strip():
+                            try:
+                                _orphan_max = float(os.getenv("MID_PENDING_ORPHAN_MAX_AGE_MIN", "35") or 35.0)
+                                _age_m3 = max(0.0, (float(now_ts) - float(created_ts or now_ts)) / 60.0)
+                            except Exception:
+                                _orphan_max, _age_m3 = 35.0, 0.0
+                            if _orphan_max > 0 and _age_m3 >= _orphan_max:
+                                _route_txt3 = " ".join([
+                                    str(it.get("smc_setup_route") or ""),
+                                    str(it.get("emit_route") or ""),
+                                    str(it.get("smart_setup") or ""),
+                                    str(it.get("setup") or ""),
+                                    str(it.get("risk_note") or ""),
+                                ]).lower()
+                                _is_sp3 = ("structure pending" in _route_txt3) or ("structure_pending" in _route_txt3) or ("pending trigger" in _route_txt3)
+                                _bo_txt3 = str(it.get("bo_rt") or it.get("breakout_retest") or "").upper()
+                                _has_bo3 = ("BO" in _bo_txt3 and "RT" in _bo_txt3)
+                                if not (_is_sp3 or _has_bo3):
+                                    removed += 1
+                                    continue
+                except Exception:
+                    pass
+
                 out.append(it)
             return out, removed
 
@@ -27655,7 +27721,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                     try:
-                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                                        logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
                                     except Exception:
                                         pass
                                     if keep_it:
@@ -28080,7 +28146,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                     keep_it, outc = _pending_apply_fail(it, _touch_final_reason, now)
                                                     _pending_log_trigger(sym, market, direction, outc, _touch_final_reason, it, float(price))
                                                     try:
-                                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _touch_final_reason)
+                                                        logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _touch_final_reason)
                                                     except Exception:
                                                         pass
                                                     if keep_it:
@@ -28601,7 +28667,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                                 _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                 try:
-                                    logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                                    logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
                                 except Exception:
                                     pass
                                 if keep_it:
@@ -30180,7 +30246,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                         _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                         try:
-                            logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                            logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
                         except Exception:
                             pass
                         if keep_it:
