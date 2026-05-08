@@ -4017,6 +4017,105 @@ def _mid_is_waitable_final_emit_reason(reason: str) -> bool:
         return False
 
 
+def _mid_pending_is_early_save_candidate(it: dict | None, reason: str = "", policy_note: str = "") -> tuple[bool, str]:
+    """v61 balanced pending policy: save only genuinely early ideas.
+
+    Pending is not a trash bin for every blocked setup.  It should hold only setups
+    where the idea is still alive but the bot is too early and must wait for
+    acceptance / breakdown / fresh displacement.
+
+    Therefore:
+    - good origin/retest setups should emit immediately through the normal emit path;
+    - bad context / late pump / contradiction should be killed, not stored;
+    - clean-path waits are stored only when they are fresh early triggers.
+    """
+    try:
+        if str(os.getenv("MID_PENDING_SAVE_ONLY_EARLY", "1") or "1").strip().lower() not in ("1", "true", "yes", "on"):
+            return (True, "save_only_early_off")
+    except Exception:
+        pass
+    try:
+        rec = it if isinstance(it, dict) else {}
+        r = str(reason or "").lower()
+        note = str(policy_note or "").lower()
+
+        # Hard late-pump / late-dump cases from the report should not sit in pending.
+        # They are not "early"; they are usually bad location.
+        late_keys = (
+            "late_long_after_pump",
+            "late long after pump",
+            "late_long_upper_range",
+            "late_short_lower_range",
+            "after_dump",
+            "late short after dump",
+        )
+        if any(k in r or k in note for k in late_keys):
+            try:
+                allow_late = str(os.getenv("MID_PENDING_SAVE_LATE_AFTER_PUMP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                allow_late = False
+            if not allow_late:
+                return (False, "not_early:late_location")
+
+        # Explicit structure-pending acceptance/breakdown waits are valid pending.
+        if "quality_path_structure_pending_wait" in r:
+            return (True, "early:structure_pending_acceptance")
+
+        route_txt = " ".join([
+            str(rec.get("smc_setup_route") or ""),
+            str(rec.get("emit_route") or ""),
+            str(rec.get("smart_setup_route") or ""),
+            str(rec.get("smart_setup") or ""),
+            str(rec.get("setup") or ""),
+            str(rec.get("setup_source_label") or ""),
+            str(rec.get("risk_note") or ""),
+            str(rec.get("confirmations") or ""),
+        ]).lower()
+        is_structure_pending = ("structure pending" in route_txt) or ("structure_pending" in route_txt) or ("pending trigger" in route_txt)
+
+        bo_txt = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").upper()
+        bo_fresh = False
+        try:
+            bo_age = rec.get("breakout_first_age_bars_create")
+            if bo_age is None:
+                bo_age = rec.get("bo_age_bars")
+            max_bo_age = int(float(os.getenv("MID_PENDING_EARLY_MAX_BO_AGE_BARS", "2") or 2))
+            if bo_age is not None and float(bo_age) <= max_bo_age:
+                bo_fresh = True
+        except Exception:
+            bo_fresh = False
+        if ("BO" in bo_txt and "RT" in bo_txt) and bo_fresh:
+            bo_fresh = True
+
+        # Clean-path/no-acceptance can be kept only if it is a fresh early trigger.
+        clean_or_accept_wait = any(k in r for k in (
+            "quality_path_clean_path_long_wall_wait",
+            "quality_path_clean_path_short_wall_wait",
+            "no_acceptance",
+            "no_breakdown",
+            "tp1 blocked by support",
+            "tp1 blocked by resistance",
+            "no clean upside path",
+            "no clean downside path",
+        ))
+        if clean_or_accept_wait:
+            if is_structure_pending:
+                return (True, "early:structure_pending_clean_path")
+            if bo_fresh:
+                return (True, "early:fresh_bo_rt_clean_path")
+            return (False, "not_early:stale_or_non_structure_clean_path")
+
+        # Fresh-expansion waits are valid only for fresh BO/RT or structure-pending ideas.
+        if "no_fresh_expansion" in r or "no_post_entry_expansion" in r:
+            if is_structure_pending or bo_fresh:
+                return (True, "early:waiting_fresh_expansion")
+            return (False, "not_early:no_fresh_expansion_stale")
+
+        return (False, "not_early:unknown_wait")
+    except Exception as exc:
+        return (False, f"not_early:error:{type(exc).__name__}")
+
+
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -26234,11 +26333,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         try:
             if bool(_policy_keep):
+                # v61: Even a waitable quality reason is kept only when the pending
+                # is a genuinely early trigger waiting for acceptance/breakdown.
+                # Old/stale/non-structure clean-path waits are removed so the queue
+                # does not become a warehouse of every rejected setup.
+                try:
+                    _early_keep, _early_note = _mid_pending_is_early_save_candidate(it, r_raw, _policy_note)
+                except Exception:
+                    _early_keep, _early_note = (False, "not_early:policy_error")
+                if not _early_keep:
+                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                    it["last_fail_reason"] = f"pending_not_early:{r_raw}"[:300]
+                    it["last_fail_ts"] = float(now_ts)
+                    it["pending_early_policy"] = str(_early_note)
+                    _pending_clear_cooldown(it)
+                    return (False, "hard_fail")
+
                 it["last_fail_reason"] = r_raw or "quality_wait"
                 it["last_fail_ts"] = float(now_ts)
                 it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
                 it["quality_wait_ts"] = float(now_ts)
                 it["pending_wait_policy"] = str(_policy_note)
+                it["pending_early_policy"] = str(_early_note)
 
                 # Do not use trigger_attempts as a hard kill for WAITABLE reasons.
                 # The loop can poll every few seconds, so attempts can grow fast while
@@ -26287,10 +26403,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         # waitable full reason, keep it pending.
         try:
             if str(os.getenv("MID_V57_QUALITY_GUARD_KEEP_PENDING", "1") or "1").strip().lower() in ("1", "true", "yes", "on") and _mid_is_waitable_final_emit_reason(str(reason or "")):
+                _early_keep, _early_note = _mid_pending_is_early_save_candidate(it, str(reason or ""), "compat_wait")
+                if not _early_keep:
+                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                    it["last_fail_reason"] = f"pending_not_early:{str(reason or '')}"[:300]
+                    it["last_fail_ts"] = float(now_ts)
+                    it["pending_early_policy"] = str(_early_note)
+                    _pending_clear_cooldown(it)
+                    return (False, "hard_fail")
                 it["last_fail_reason"] = str(reason or "quality_wait")
                 it["last_fail_ts"] = float(now_ts)
                 it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
                 it["quality_wait_ts"] = float(now_ts)
+                it["pending_early_policy"] = str(_early_note)
                 return (True, "wait")
         except Exception:
             pass
@@ -35095,15 +35220,37 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     pass
                                                 continue
                                             else:
+                                                # v61: WAITABLE does not automatically mean "store".
+                                                # Store only genuinely early ideas that may improve after
+                                                # acceptance/breakdown; do not keep every blocked setup.
+                                                _early_keep, _early_note = _mid_pending_is_early_save_candidate(rec, _pending_policy_reason, _policy_note)
+                                                if not _early_keep:
+                                                    try:
+                                                        logger.info(
+                                                            "[mid][pending][kill_not_early] %s %s %s policy=%s early=%s reason=%s",
+                                                            sym, marketu, diru, str(_policy_note), str(_early_note), str(_pending_policy_reason)[:700],
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        _pending_skip(sym, f"pending_kill:{str(_early_note)}")
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        _rej_add(sym, f"pending_kill:{str(_early_note)}")
+                                                    except Exception:
+                                                        pass
+                                                    continue
                                                 try:
                                                     rec["pending_wait_policy"] = str(_policy_note)
                                                     rec["pending_wait_reason"] = str(_pending_policy_reason)[:700]
+                                                    rec["pending_early_policy"] = str(_early_note)
                                                 except Exception:
                                                     pass
                                                 try:
                                                     logger.info(
-                                                        "[mid][pending][keep_waitable] %s %s %s policy=%s reason=%s",
-                                                        sym, marketu, diru, str(_policy_note), str(_pending_policy_reason)[:700],
+                                                        "[mid][pending][keep_early_waitable] %s %s %s policy=%s early=%s reason=%s",
+                                                        sym, marketu, diru, str(_policy_note), str(_early_note), str(_pending_policy_reason)[:700],
                                                     )
                                                 except Exception:
                                                     pass
