@@ -4116,6 +4116,89 @@ def _mid_pending_is_early_save_candidate(it: dict | None, reason: str = "", poli
         return (False, f"not_early:error:{type(exc).__name__}")
 
 
+def _mid_pending_record_purge_reason(it: dict | None, now_ts: float | None = None) -> str:
+    """v63: purge zombie pending records before trigger evaluation.
+
+    Some old pending rows can return outcome=wait because of zone_hold even though
+    the saved raw reason is terminal (directional_contradiction / smc_hard_block /
+    sl_too_tight / tp1_too_close). Also, waitable clean-path rows must expire by
+    age even when they never reach a final emit gate.
+    """
+    try:
+        rec = it if isinstance(it, dict) else {}
+        now_f = float(now_ts or time.time())
+        created = float(rec.get("created_ts") or now_f or 0.0)
+        age_m = max(0.0, (now_f - created) / 60.0) if created > 0 else 0.0
+        mkt_u = str(rec.get("market") or "SPOT").upper().strip()
+
+        parts = []
+        for k in (
+            "_trig_hardblock_raw_reason", "_trig_term_reason", "_trig_primary_reason",
+            "last_fail_reason", "pending_kill_policy", "pending_wait_policy",
+            "pending_wait_reason", "pending_early_policy", "smart_emit_reason",
+            "risk_note", "reject_reason", "block_reason", "trap_reason",
+        ):
+            try:
+                v = rec.get(k)
+                if v is not None and str(v).strip():
+                    parts.append(str(v))
+            except Exception:
+                pass
+        try:
+            sem = rec.get("smart_emit_meta")
+            if isinstance(sem, dict):
+                for k in ("primary_reason", "all_reasons", "final_emit_kill"):
+                    v = sem.get(k)
+                    if v is not None and str(v).strip():
+                        parts.append(str(v))
+        except Exception:
+            pass
+        txt = " | ".join(parts).lower()
+
+        # Terminal raw reasons must remove the pending even if the current loop is still in zone_hold.
+        terminal_keys = (
+            "directional_contradiction", "smc_hard_block", "structure_broken",
+            "invalidation_hit", "trend_flip", "sl_too_tight", "tp1_too_close",
+            "rr_too_low", "zone_too_wide_guard", "breakout_zone_too_wide",
+            "smart_setup_trap", "trap_block", "rsi_long_extreme", "rsi_short_extreme",
+            "confidence<", "scale_mismatch", "contract check failed",
+        )
+        for k in terminal_keys:
+            if k in txt:
+                return f"purge_terminal:{k}"
+
+        # Waitable ideas are allowed to wait, but not forever.  This catches records
+        # that are far/near and therefore never pass through _pending_apply_fail().
+        waitable = False
+        try:
+            waitable, _pn = _mid_pending_reason_policy(txt)
+        except Exception:
+            waitable = False
+        if waitable:
+            try:
+                max_age = float(os.getenv(
+                    "MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN" if mkt_u == "FUTURES" else "MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN",
+                    "35" if mkt_u == "FUTURES" else "45",
+                ) or (35 if mkt_u == "FUTURES" else 45))
+            except Exception:
+                max_age = 35.0 if mkt_u == "FUTURES" else 45.0
+            if max_age > 0 and age_m >= max_age:
+                return f"purge_waitable_expired:{age_m:.1f}>{max_age:.1f}m"
+            try:
+                early_ok, early_note = _mid_pending_is_early_save_candidate(rec, txt, "record_purge")
+            except Exception:
+                early_ok, early_note = (False, "not_early:record_purge_error")
+            if not early_ok:
+                return f"purge_not_early:{early_note}"
+
+        return ""
+    except Exception as exc:
+        try:
+            return f"purge_error:{type(exc).__name__}"
+        except Exception:
+            return "purge_error"
+
+
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -27055,6 +27138,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     created = float(it.get("created_ts") or 0.0) or now
                     if not sym or entry0 <= 0:
                         continue
+
+                    # v63: purge zombie pendings before any zone_hold/wait path.
+                    # This removes old rows with terminal raw reasons and expires waitable rows
+                    # even when they never reach final_emit_gate again.
+                    try:
+                        _purge_reason = _mid_pending_record_purge_reason(it, now)
+                    except Exception:
+                        _purge_reason = ""
+                    if _purge_reason:
+                        try:
+                            logger.info("[mid][pending][purge] %s %s %s reason=%s age_m=%.1f attempts=%s fails=%s", sym, market, direction, _purge_reason, max(0.0, (float(now) - float(created or now)) / 60.0), int(it.get("trigger_attempts") or 0), int(it.get("fail_count") or 0))
+                        except Exception:
+                            pass
+                        try:
+                            removed_n += 1
+                        except Exception:
+                            pass
+                        _pending_clear_cooldown(it)
+                        continue
+
                     # expire
                     ttl_item = float(it.get("ttl_min") or ttl_min)
                     if (now - created) > ttl_item * 60:
