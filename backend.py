@@ -26212,28 +26212,85 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     def _pending_apply_fail(it: dict, reason: str, now_ts: float) -> tuple[bool, str]:
         """Update pending fail bookkeeping and return (keep, outcome).
 
-        outcome is one of: 'soft_fail', 'hard_fail'.
+        outcome is one of: 'wait', 'soft_fail', 'hard_fail'.
 
-        Smart delete policy:
-        - HARD reasons -> drop immediately (terminal invalidation)
-        - SOFT reasons -> keep waiting (do not increment fail_count), but still enforce max_attempts
-        - Default -> counts as fail and is subject to caps
+        v60 strict pending lifecycle:
+        - WAITABLE quality reasons stay pending until a real better point appears.
+          They do NOT die just because the loop checked them many times.
+        - KILL reasons are removed immediately, including old/zombie pendings created
+          by previous versions.
+        - Generic soft checks keep the old behavior.
         """
-        r0 = str(reason or "fail").strip().lower()
+        r_raw = str(reason or "fail").strip()
+        r0 = r_raw.lower()
 
-        # v57 quality-first pending: if the trigger fired too early (under resistance,
-        # above support, too far from anchor, etc.), do NOT consume the setup as a
-        # failed signal. Keep it alive and wait for a cleaner acceptance/entry point.
+        # v60: apply the same WAIT/KILL policy during trigger rechecks, not only when
+        # creating a pending. This purges old pending zombies like directional_contradiction,
+        # tp1_too_close and sl_too_tight, while keeping clean_path/acceptance waits alive.
+        try:
+            _policy_keep, _policy_note = _mid_pending_reason_policy(r_raw)
+        except Exception:
+            _policy_keep, _policy_note = (False, "kill:policy_error")
+
+        try:
+            if bool(_policy_keep):
+                it["last_fail_reason"] = r_raw or "quality_wait"
+                it["last_fail_ts"] = float(now_ts)
+                it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
+                it["quality_wait_ts"] = float(now_ts)
+                it["pending_wait_policy"] = str(_policy_note)
+
+                # Do not use trigger_attempts as a hard kill for WAITABLE reasons.
+                # The loop can poll every few seconds, so attempts can grow fast while
+                # the idea is still simply waiting for acceptance/breakdown.
+                try:
+                    created_ts = float(it.get("created_ts") or now_ts or 0.0)
+                    age_m = max(0.0, (float(now_ts) - created_ts) / 60.0) if created_ts > 0 else 0.0
+                except Exception:
+                    age_m = 0.0
+                try:
+                    mkt_u = str(it.get("market") or "").upper().strip()
+                    if mkt_u == "FUTURES":
+                        max_age_m = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN", "35") or 35.0)
+                    else:
+                        max_age_m = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN", "45") or 45.0)
+                except Exception:
+                    max_age_m = 45.0
+                try:
+                    max_q_wait = int(os.getenv("MID_PENDING_WAITABLE_MAX_CHECKS", "80") or 80)
+                except Exception:
+                    max_q_wait = 80
+
+                if max_age_m > 0 and age_m >= max_age_m:
+                    it["last_fail_reason"] = f"waitable_expired:{r_raw}"[:300]
+                    _pending_clear_cooldown(it)
+                    return (False, "hard_fail")
+                if max_q_wait > 0 and int(it.get("quality_wait_count") or 0) >= max_q_wait:
+                    it["last_fail_reason"] = f"waitable_checks_expired:{r_raw}"[:300]
+                    _pending_clear_cooldown(it)
+                    return (False, "hard_fail")
+                return (True, "wait")
+
+            # Only explicit terminal policies kill immediately. Generic not_waitable keeps
+            # legacy handling below so ordinary soft filters don't become too aggressive.
+            if str(_policy_note or "").startswith("kill:") and str(_policy_note) not in ("kill:not_waitable", "kill:policy_error"):
+                it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                it["last_fail_reason"] = r_raw or "policy_kill"
+                it["last_fail_ts"] = float(now_ts)
+                it["pending_kill_policy"] = str(_policy_note)
+                _pending_clear_cooldown(it)
+                return (False, "hard_fail")
+        except Exception:
+            pass
+
+        # v57 quality-first pending compatibility: if a legacy caller still passes a
+        # waitable full reason, keep it pending.
         try:
             if str(os.getenv("MID_V57_QUALITY_GUARD_KEEP_PENDING", "1") or "1").strip().lower() in ("1", "true", "yes", "on") and _mid_is_waitable_final_emit_reason(str(reason or "")):
                 it["last_fail_reason"] = str(reason or "quality_wait")
                 it["last_fail_ts"] = float(now_ts)
                 it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
                 it["quality_wait_ts"] = float(now_ts)
-                _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
-                if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
-                    _pending_clear_cooldown(it)
-                    return (False, "hard_fail")
                 return (True, "wait")
         except Exception:
             pass
@@ -27470,7 +27527,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _final_emit_reason:
                                     _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                     try:
                                         logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
@@ -27502,7 +27559,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _pre_emit_reason:
                                     _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                     try:
                                         logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_instant_emit", _pre_emit_reason)
@@ -27895,7 +27952,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                 )
                                                 if _touch_final_reason:
                                                     _apply_reason = _mid_final_emit_apply_reason(_touch_final_reason)
-                                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                                    keep_it, outc = _pending_apply_fail(it, _touch_final_reason, now)
                                                     _pending_log_trigger(sym, market, direction, outc, _touch_final_reason, it, float(price))
                                                     try:
                                                         logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _touch_final_reason)
@@ -27929,7 +27986,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                     )
                                                     if _pre_emit_reason:
                                                         _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                                        keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
                                                         _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                                         try:
                                                             logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "zone_touch_emit", _pre_emit_reason)
@@ -28416,7 +28473,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             )
                             if _final_emit_reason:
                                 _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                                keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                                 _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                 try:
                                     logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
@@ -28474,7 +28531,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _pre_emit_reason:
                                     _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                     try:
                                         logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "instant_emit_vip", _pre_emit_reason)
@@ -29995,7 +30052,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     )
                     if _final_emit_reason:
                         _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                        keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
                         _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                         try:
                             logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
@@ -30067,7 +30124,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     )
                     if _pre_emit_reason:
                         _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                        keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
                         _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                         try:
                             logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_confirmed_emit", _pre_emit_reason)
