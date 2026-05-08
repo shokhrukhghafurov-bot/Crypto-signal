@@ -27619,7 +27619,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         # and never got another trigger pass because the code only effectively acted
                         # like an edge-trigger. By default we allow re-check on every poll while
                         # in-zone; users can throttle it with MID_PENDING_RECHECK_IN_ZONE_SEC.
-                        recheck_in_zone_sec = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "0") or 0)
+                        recheck_in_zone_sec = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "30") or 30)
                         if (not instant_emit_due_to_nofilters) and (not pending_instant_emit) and last_try > 0:
                             if bool(it.get("_in_zone") or it.get("_in_zone_tol") or False):
                                 if (not entered_zone_now) and recheck_in_zone_sec > 0 and (now - last_try) < recheck_in_zone_sec:
