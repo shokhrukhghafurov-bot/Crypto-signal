@@ -3232,51 +3232,6 @@ def _mid_report_path_quality_guard_reason(
                     and float(upper_wick_atr_5m) <= 0.35
                 )
             )
-
-            # v58: hard clean-path / late-pump WAIT guards.  A detected setup is only
-            # an idea until the entry has a clean road to TP1.  LONG under a seller
-            # reaction or in the upper 25-30% of the local range after a pump must wait
-            # for real acceptance/expansion instead of emitting immediately.
-            try:
-                v58_clean_path_guard = str(os.getenv("MID_V58_CLEAN_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                v58_clean_path_guard = True
-            try:
-                v58_clean_path_max_tp_pct = float(os.getenv("MID_V58_CLEAN_PATH_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
-            except Exception:
-                v58_clean_path_max_tp_pct = 0.035
-            try:
-                v58_late_pump_min_atr = float(os.getenv("MID_V58_LATE_PUMP_MIN_ATR", "0.90") or 0.90)
-            except Exception:
-                v58_late_pump_min_atr = 0.90
-            try:
-                v58_upper_range_pos = float(os.getenv("MID_V58_LONG_UPPER_RANGE_POS", "0.70") or 0.70)
-            except Exception:
-                v58_upper_range_pos = 0.70
-            if (
-                v58_clean_path_guard
-                and level_before_tp1
-                and no_accept
-                and clean_space_pct <= float(v58_clean_path_max_tp_pct)
-                and not real_bull_continuation
-            ):
-                return (
-                    f"quality_path_clean_path_long_wall_wait:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
-                    f"|range_pos={float(rpos):.2f}|accept=0|body_atr={bv:.2f}|vol={rv:.2f}"
-                )
-            if (
-                v58_clean_path_guard
-                and late_from_low >= float(v58_late_pump_min_atr)
-                and float(rpos) >= float(v58_upper_range_pos)
-                and no_accept
-                and clean_space_pct <= float(v58_clean_path_max_tp_pct)
-                and not real_bull_continuation
-            ):
-                return (
-                    f"quality_path_late_long_upper_range_wait:side=LONG|clean={clean_space_pct*100:.2f}%"
-                    f"|late_atr={late_from_low:.2f}|range_pos={float(rpos):.2f}|accept=0"
-                )
-
             if review_guard_v55:
                 # User-reviewed LOSS pattern: LONG under local high / resistance,
                 # TP1 behind seller reaction, no acceptance.  Do not block real
@@ -3486,66 +3441,7 @@ def _mid_report_path_quality_guard_reason(
                     f"|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}|fast={int(bool(fast_continuation_ok))}"
                 )
 
-            # v57: Structure pending is only a saved idea until the market proves the
-            # location.  It must not emit as a live LONG in the upper range / under a
-            # seller wall just because the trigger fired.  Wait for acceptance above
-            # resistance or a true fast-continuation breakout.
-            try:
-                sp_accept_guard = str(os.getenv("MID_V57_STRUCTURE_PENDING_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                sp_accept_guard = True
-            try:
-                sp_accept_max_tp_pct = float(os.getenv("MID_V57_STRUCTURE_PENDING_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
-            except Exception:
-                sp_accept_max_tp_pct = 0.035
-            try:
-                sp_accept_late_atr = float(os.getenv("MID_V57_STRUCTURE_PENDING_LATE_ATR", "0.75") or 0.75)
-            except Exception:
-                sp_accept_late_atr = 0.75
-            try:
-                sp_require_2close = str(os.getenv("MID_V58_STRUCTURE_PENDING_REQUIRE_2_CLOSES", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                sp_require_2close = True
-            # We do not always have exact historical "two closes above wall" fields, so
-            # two green candles + higher lows is used as a conservative proxy.  It keeps
-            # the setup in pending until the market proves acceptance and fresh expansion.
-            sp_two_close_proxy_bull = bool(two_green_now and higher_lows_now)
-            sp_fresh_expansion_bull = bool(
-                (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v > 0)
-                and float(close_pos_5m) >= 0.68
-                and not bool(two_red_now)
-                and float(upper_wick_atr_5m) <= 0.35
-            )
-            sp_accept_ok_for_emit_long = bool(
-                strict_bull_acceptance
-                and sp_fresh_expansion_bull
-                and ((not sp_require_2close) or sp_two_close_proxy_bull)
-            )
-            sp_wait_for_long_acceptance = bool(
-                sp_accept_guard
-                and structure_pending_route
-                and clean_space_pct <= float(sp_accept_max_tp_pct)
-                and not sp_accept_ok_for_emit_long
-                and not bool(fast_continuation_ok)
-                and (
-                    no_accept
-                    or level_before_tp1
-                    or tp1_blocked
-                    or near_level
-                    or local_top_bad
-                    or range_bad
-                    or pulled_back_from_local_high
-                    or late_from_low >= float(sp_accept_late_atr)
-                )
-            )
-            if sp_wait_for_long_acceptance:
-                return (
-                    f"quality_path_structure_pending_wait_acceptance:side=LONG|clean={clean_space_pct*100:.2f}%"
-                    f"|late_atr={late_from_low:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
-                    f"|level={level_name}|accept=0|fast={int(bool(fast_continuation_ok))}"
-                )
-
-            if fast_continuation_ok or (strong_accept and (not structure_pending_route or bool(locals().get("sp_accept_ok_for_emit_long", False)))):
+            if strong_accept or fast_continuation_ok:
                 return ""
             # v53: weak fresh_momentum_ok alone is not enough to pass old Structure
             # pending when TP1 is small and price is still below a local seller wall.
@@ -3680,50 +3576,6 @@ def _mid_report_path_quality_guard_reason(
                 and float(lower_wick_atr_5m) <= 0.35
             )
         )
-
-        # v58 mirror: do not SHORT directly above buyer reaction / support, and do
-        # not sell the lower 25-30% of the local range after a dump without breakdown
-        # acceptance.  Keep the idea pending until the support is accepted below.
-        try:
-            v58_clean_path_guard = str(os.getenv("MID_V58_CLEAN_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            v58_clean_path_guard = True
-        try:
-            v58_clean_path_max_tp_pct = float(os.getenv("MID_V58_CLEAN_PATH_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
-        except Exception:
-            v58_clean_path_max_tp_pct = 0.035
-        try:
-            v58_late_dump_min_atr = float(os.getenv("MID_V58_LATE_DUMP_MIN_ATR", "0.90") or 0.90)
-        except Exception:
-            v58_late_dump_min_atr = 0.90
-        try:
-            v58_lower_range_pos = float(os.getenv("MID_V58_SHORT_LOWER_RANGE_POS", "0.30") or 0.30)
-        except Exception:
-            v58_lower_range_pos = 0.30
-        if (
-            v58_clean_path_guard
-            and level_before_tp1
-            and no_accept
-            and clean_space_pct <= float(v58_clean_path_max_tp_pct)
-            and not real_bear_continuation
-        ):
-            return (
-                f"quality_path_clean_path_short_wall_wait:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
-                f"|range_pos={float(rpos):.2f}|accept=0|body_atr={bv:.2f}|vol={rv:.2f}"
-            )
-        if (
-            v58_clean_path_guard
-            and late_from_high >= float(v58_late_dump_min_atr)
-            and float(rpos) <= float(v58_lower_range_pos)
-            and no_accept
-            and clean_space_pct <= float(v58_clean_path_max_tp_pct)
-            and not real_bear_continuation
-        ):
-            return (
-                f"quality_path_late_short_lower_range_wait:side=SHORT|clean={clean_space_pct*100:.2f}%"
-                f"|late_atr={late_from_high:.2f}|range_pos={float(rpos):.2f}|accept=0"
-            )
-
         if review_guard_v55:
             # User-reviewed LOSS pattern: SHORT too low / above support after dump,
             # TP1 behind buyer reaction, no breakdown acceptance.  Strong bearish
@@ -3807,80 +3659,7 @@ def _mid_report_path_quality_guard_reason(
                 f"|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
             )
 
-        # v57 mirror: Structure pending / BOS retest SHORT must wait for breakdown
-        # acceptance below support.  A trigger above support is only a saved idea, not
-        # a live emit.
-        try:
-            structure_pending_route = bool("structure" in route_s or "pending" in route_s or "normal_pending" in route_s or "bos" in route_s or "retest" in route_s)
-        except Exception:
-            structure_pending_route = False
-        try:
-            sp_accept_guard = str(os.getenv("MID_V57_STRUCTURE_PENDING_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            sp_accept_guard = True
-        try:
-            sp_accept_max_tp_pct = float(os.getenv("MID_V57_STRUCTURE_PENDING_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
-        except Exception:
-            sp_accept_max_tp_pct = 0.035
-        try:
-            sp_accept_late_atr = float(os.getenv("MID_V57_STRUCTURE_PENDING_LATE_ATR", "0.75") or 0.75)
-        except Exception:
-            sp_accept_late_atr = 0.75
-        strict_bear_acceptance = bool(
-            strong_accept
-            or (
-                level_value > 0
-                and close < (level_value - pad_abs)
-                and float(close_pos_5m) <= 0.30
-                and not bool(two_green_now)
-                and float(lower_wick_atr_5m) <= 0.25
-                and (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v < 0)
-            )
-        )
-        pulled_back_from_local_low = bool(recent_low > 0 and recent_low < entry and pullback_from_low_atr >= 0.08)
-        try:
-            sp_require_2close = str(os.getenv("MID_V58_STRUCTURE_PENDING_REQUIRE_2_CLOSES", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            sp_require_2close = True
-        sp_two_close_proxy_bear = bool(two_red_now and lower_highs_now)
-        sp_fresh_expansion_bear = bool(
-            (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v < 0)
-            and float(close_pos_5m) <= 0.32
-            and not bool(two_green_now)
-            and float(lower_wick_atr_5m) <= 0.35
-        )
-        sp_accept_ok_for_emit_short = bool(
-            strict_bear_acceptance
-            and sp_fresh_expansion_bear
-            and ((not sp_require_2close) or sp_two_close_proxy_bear)
-        )
-        sp_wait_for_short_acceptance = bool(
-            sp_accept_guard
-            and structure_pending_route
-            and clean_space_pct <= float(sp_accept_max_tp_pct)
-            and not sp_accept_ok_for_emit_short
-            and not bool(fast_continuation_ok)
-            and (
-                no_accept
-                or level_before_tp1
-                or tp1_blocked
-                or near_level
-                or local_bottom_bad
-                or range_bad
-                or pulled_back_from_local_low
-                or late_from_high >= float(sp_accept_late_atr)
-            )
-        )
-        if sp_wait_for_short_acceptance:
-            return (
-                f"quality_path_structure_pending_wait_breakdown:side=SHORT|clean={clean_space_pct*100:.2f}%"
-                f"|late_atr={late_from_high:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
-                f"|level={level_name}|accept=0|fast={int(bool(fast_continuation_ok))}"
-            )
-
-        if fast_continuation_ok or (strong_accept and (not structure_pending_route or bool(locals().get("sp_accept_ok_for_emit_short", False)))):
-            return ""
-        if fresh_momentum_ok and not structure_pending_route:
+        if strong_accept or fresh_momentum_ok or fast_continuation_ok:
             return ""
         if dump_rejection:
             return (
@@ -3930,275 +3709,6 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
-def _mid_pending_reason_policy(reason: str) -> tuple[bool, str]:
-    """Return (keep_pending, policy_reason) for a blocked setup.
-
-    v59 strict quality-wait:
-    - WAIT only when the setup idea is alive and the market merely needs acceptance,
-      breakdown, clean path, or fresh expansion.
-    - KILL terminal/malformed cases immediately: contradiction, hard SMC block, trap,
-      too tight SL, too close TP1, too wide zone, low confidence, RSI extremes.
-
-    This prevents the scanner from filling pending with dead ideas like:
-    directional_contradiction, smc_hard_block, sl_too_tight, tp1_too_close.
-    """
-    try:
-        r = str(reason or "").strip().lower()
-    except Exception:
-        return (False, "empty_reason")
-    if not r:
-        return (False, "empty_reason")
-
-    kill_keys = (
-        "directional_contradiction",
-        "smc_hard_block",
-        "structure_broken",
-        "invalidation_hit",
-        "trend_flip",
-        "sl_too_tight",
-        "tp1_too_close",
-        "rr_too_low",
-        "levels:",
-        "zone_too_wide_guard",
-        "breakout_zone_too_wide",
-        "confidence<",
-        "rsi_long_extreme",
-        "rsi_short_extreme",
-        "smart_setup_trap",
-        "trap_block",
-        "scale_mismatch",
-        "contract check failed",
-    )
-    for k in kill_keys:
-        if k in r:
-            return (False, f"kill:{k}")
-
-    wait_keys = (
-        # Clean-path / wall: wait for close through the wall or a fresh expansion candle.
-        "quality_path_clean_path_long_wall_wait",
-        "quality_path_clean_path_short_wall_wait",
-        # Structure pending: trigger is not enough; wait for acceptance/breakdown.
-        "quality_path_structure_pending_wait_acceptance",
-        "quality_path_structure_pending_wait_breakdown",
-        # Late after pump/dump but structurally alive: wait for discount/reclaim or acceptance.
-        "quality_path_late_long_after_pump_no_acceptance",
-        "quality_path_late_long_upper_range_wait",
-        "quality_path_late_short_lower_range_wait",
-        # Oversized fast-timeframe futures geometry: keep waiting for a tighter re-entry.
-        "quality_path_oversized_futures_sl_wait",
-        "quality_path_oversized_futures_tp1_wait",
-        # Generic temporary confirmation failures.
-        "no_acceptance",
-        "no_breakdown",
-        "no_fresh_expansion",
-        "no_post_entry_expansion",
-        "no clean downside path",
-        "no clean upside path",
-        "tp1 blocked by support",
-        "tp1 blocked by resistance",
-    )
-    for k in wait_keys:
-        if k in r:
-            return (True, f"wait:{k}")
-
-    # Important: generic quality_path is NOT automatically waitable anymore.
-    # Some quality_path reasons are hard blocks (fake RR, local top/bottom, weak RR, etc.).
-    if r.startswith("quality_path") or r.startswith("quality_guard"):
-        return (False, "kill:quality_not_waitable")
-
-    return (False, "kill:not_waitable")
-
-
-def _mid_is_waitable_final_emit_reason(reason: str) -> bool:
-    """Compatibility wrapper used by pending trigger loop."""
-    try:
-        return bool(_mid_pending_reason_policy(reason)[0])
-    except Exception:
-        return False
-
-
-def _mid_pending_is_early_save_candidate(it: dict | None, reason: str = "", policy_note: str = "") -> tuple[bool, str]:
-    """v61 balanced pending policy: save only genuinely early ideas.
-
-    Pending is not a trash bin for every blocked setup.  It should hold only setups
-    where the idea is still alive but the bot is too early and must wait for
-    acceptance / breakdown / fresh displacement.
-
-    Therefore:
-    - good origin/retest setups should emit immediately through the normal emit path;
-    - bad context / late pump / contradiction should be killed, not stored;
-    - clean-path waits are stored only when they are fresh early triggers.
-    """
-    try:
-        if str(os.getenv("MID_PENDING_SAVE_ONLY_EARLY", "1") or "1").strip().lower() not in ("1", "true", "yes", "on"):
-            return (True, "save_only_early_off")
-    except Exception:
-        pass
-    try:
-        rec = it if isinstance(it, dict) else {}
-        r = str(reason or "").lower()
-        note = str(policy_note or "").lower()
-
-        # Hard late-pump / late-dump cases from the report should not sit in pending.
-        # They are not "early"; they are usually bad location.
-        late_keys = (
-            "late_long_after_pump",
-            "late long after pump",
-            "late_long_upper_range",
-            "late_short_lower_range",
-            "after_dump",
-            "late short after dump",
-        )
-        if any(k in r or k in note for k in late_keys):
-            try:
-                allow_late = str(os.getenv("MID_PENDING_SAVE_LATE_AFTER_PUMP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                allow_late = False
-            if not allow_late:
-                return (False, "not_early:late_location")
-
-        # Explicit structure-pending acceptance/breakdown waits are valid pending.
-        if "quality_path_structure_pending_wait" in r:
-            return (True, "early:structure_pending_acceptance")
-
-        route_txt = " ".join([
-            str(rec.get("smc_setup_route") or ""),
-            str(rec.get("emit_route") or ""),
-            str(rec.get("smart_setup_route") or ""),
-            str(rec.get("smart_setup") or ""),
-            str(rec.get("setup") or ""),
-            str(rec.get("setup_source_label") or ""),
-            str(rec.get("risk_note") or ""),
-            str(rec.get("confirmations") or ""),
-        ]).lower()
-        is_structure_pending = ("structure pending" in route_txt) or ("structure_pending" in route_txt) or ("pending trigger" in route_txt)
-
-        bo_txt = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").upper()
-        bo_fresh = False
-        try:
-            bo_age = rec.get("breakout_first_age_bars_create")
-            if bo_age is None:
-                bo_age = rec.get("bo_age_bars")
-            max_bo_age = int(float(os.getenv("MID_PENDING_EARLY_MAX_BO_AGE_BARS", "2") or 2))
-            if bo_age is not None and float(bo_age) <= max_bo_age:
-                bo_fresh = True
-        except Exception:
-            bo_fresh = False
-        if ("BO" in bo_txt and "RT" in bo_txt) and bo_fresh:
-            bo_fresh = True
-
-        # Clean-path/no-acceptance can be kept only if it is a fresh early trigger.
-        clean_or_accept_wait = any(k in r for k in (
-            "quality_path_clean_path_long_wall_wait",
-            "quality_path_clean_path_short_wall_wait",
-            "no_acceptance",
-            "no_breakdown",
-            "tp1 blocked by support",
-            "tp1 blocked by resistance",
-            "no clean upside path",
-            "no clean downside path",
-        ))
-        if clean_or_accept_wait:
-            if is_structure_pending:
-                return (True, "early:structure_pending_clean_path")
-            if bo_fresh:
-                return (True, "early:fresh_bo_rt_clean_path")
-            return (False, "not_early:stale_or_non_structure_clean_path")
-
-        # Fresh-expansion waits are valid only for fresh BO/RT or structure-pending ideas.
-        if "no_fresh_expansion" in r or "no_post_entry_expansion" in r:
-            if is_structure_pending or bo_fresh:
-                return (True, "early:waiting_fresh_expansion")
-            return (False, "not_early:no_fresh_expansion_stale")
-
-        return (False, "not_early:unknown_wait")
-    except Exception as exc:
-        return (False, f"not_early:error:{type(exc).__name__}")
-
-
-def _mid_pending_record_purge_reason(it: dict | None, now_ts: float | None = None) -> str:
-    """v63: purge zombie pending records before trigger evaluation.
-
-    Some old pending rows can return outcome=wait because of zone_hold even though
-    the saved raw reason is terminal (directional_contradiction / smc_hard_block /
-    sl_too_tight / tp1_too_close). Also, waitable clean-path rows must expire by
-    age even when they never reach a final emit gate.
-    """
-    try:
-        rec = it if isinstance(it, dict) else {}
-        now_f = float(now_ts or time.time())
-        created = float(rec.get("created_ts") or now_f or 0.0)
-        age_m = max(0.0, (now_f - created) / 60.0) if created > 0 else 0.0
-        mkt_u = str(rec.get("market") or "SPOT").upper().strip()
-
-        parts = []
-        for k in (
-            "_trig_hardblock_raw_reason", "_trig_term_reason", "_trig_primary_reason",
-            "last_fail_reason", "pending_kill_policy", "pending_wait_policy",
-            "pending_wait_reason", "pending_early_policy", "smart_emit_reason",
-            "risk_note", "reject_reason", "block_reason", "trap_reason",
-        ):
-            try:
-                v = rec.get(k)
-                if v is not None and str(v).strip():
-                    parts.append(str(v))
-            except Exception:
-                pass
-        try:
-            sem = rec.get("smart_emit_meta")
-            if isinstance(sem, dict):
-                for k in ("primary_reason", "all_reasons", "final_emit_kill"):
-                    v = sem.get(k)
-                    if v is not None and str(v).strip():
-                        parts.append(str(v))
-        except Exception:
-            pass
-        txt = " | ".join(parts).lower()
-
-        # Terminal raw reasons must remove the pending even if the current loop is still in zone_hold.
-        terminal_keys = (
-            "directional_contradiction", "smc_hard_block", "structure_broken",
-            "invalidation_hit", "trend_flip", "sl_too_tight", "tp1_too_close",
-            "rr_too_low", "zone_too_wide_guard", "breakout_zone_too_wide",
-            "smart_setup_trap", "trap_block", "rsi_long_extreme", "rsi_short_extreme",
-            "confidence<", "scale_mismatch", "contract check failed",
-        )
-        for k in terminal_keys:
-            if k in txt:
-                return f"purge_terminal:{k}"
-
-        # Waitable ideas are allowed to wait, but not forever.  This catches records
-        # that are far/near and therefore never pass through _pending_apply_fail().
-        waitable = False
-        try:
-            waitable, _pn = _mid_pending_reason_policy(txt)
-        except Exception:
-            waitable = False
-        if waitable:
-            try:
-                max_age = float(os.getenv(
-                    "MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN" if mkt_u == "FUTURES" else "MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN",
-                    "35" if mkt_u == "FUTURES" else "45",
-                ) or (35 if mkt_u == "FUTURES" else 45))
-            except Exception:
-                max_age = 35.0 if mkt_u == "FUTURES" else 45.0
-            if max_age > 0 and age_m >= max_age:
-                return f"purge_waitable_expired:{age_m:.1f}>{max_age:.1f}m"
-            try:
-                early_ok, early_note = _mid_pending_is_early_save_candidate(rec, txt, "record_purge")
-            except Exception:
-                early_ok, early_note = (False, "not_early:record_purge_error")
-            if not early_ok:
-                return f"purge_not_early:{early_note}"
-
-        return ""
-    except Exception as exc:
-        try:
-            return f"purge_error:{type(exc).__name__}"
-        except Exception:
-            return "purge_error"
-
-
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -4224,40 +3734,6 @@ def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | 
             except Exception:
                 pass
         risk = abs(entry - sl)
-
-        # v57: do not emit oversized 5m/15m FUTURES risks.  These are usually not
-        # scalps anymore (TRUMP-like case: ~5.5% SL and ~7.7% TP1) and should stay
-        # pending/wait for a better re-entry instead of being sent as a live signal.
-        try:
-            oversized_guard = str(os.getenv("MID_V57_OVERSIZED_RISK_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            oversized_guard = True
-        if oversized_guard and entry > 0 and risk > 0:
-            try:
-                market_u = str(market or "").upper().strip()
-            except Exception:
-                market_u = ""
-            try:
-                tf_s = str(getattr(sig, "timeframe", "") or (ta or {}).get("timeframe") or (it or {}).get("timeframe") or "").lower()
-            except Exception:
-                tf_s = ""
-            is_fast_tf = (not tf_s) or ("5m" in tf_s) or ("15m" in tf_s)
-            sl_pct = risk / max(float(entry), 1e-12)
-            tp1_pct = (abs(float(tp1) - float(entry)) / max(float(entry), 1e-12)) if tp1 > 0 else 0.0
-            if market_u == "FUTURES" and is_fast_tf:
-                try:
-                    max_fut_sl = float(os.getenv("MID_V57_FUTURES_MAX_SL_5M_PCT", "2.50") or 2.50) / 100.0
-                except Exception:
-                    max_fut_sl = 0.025
-                try:
-                    max_fut_tp1 = float(os.getenv("MID_V57_FUTURES_MAX_TP1_5M_PCT", "4.00") or 4.00) / 100.0
-                except Exception:
-                    max_fut_tp1 = 0.040
-                if sl_pct > max_fut_sl:
-                    return f"quality_path_oversized_futures_sl_wait:sl_pct={sl_pct*100:.2f}%>{max_fut_sl*100:.2f}%|tp1_pct={tp1_pct*100:.2f}%"
-                if tp1_pct > max_fut_tp1:
-                    return f"quality_path_oversized_futures_tp1_wait:tp1_pct={tp1_pct*100:.2f}%>{max_fut_tp1*100:.2f}%|sl_pct={sl_pct*100:.2f}%"
-
         min_risk = _mid_min_stop_distance(entry, atr, ta, it)
         if entry > 0 and risk > 0 and min_risk > 0 and risk + 1e-12 < min_risk:
             return f"sl_too_tight:{risk / max(min_risk, 1e-12):.2f}x"
@@ -10063,14 +9539,6 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     WEAKNESS_NEG_HITS = _env_int_mid("SMART_WEAKNESS_NEG_HITS", 1, is_mid)
                     WEAKNESS_MIN_RETAIN_PCT = _env_float_mid("SMART_WEAKNESS_MIN_RETAIN_PCT", 0.05, is_mid)
 
-                    # v57 no-progress time stop: do not let MID scalps sit for hours
-                    # without threatening TP1.  This targets TRUMP-like losses where a
-                    # 5m idea stayed open too long with no expansion.
-                    NO_PROGRESS_EXIT_ENABLED = (os.getenv("SMART_NO_PROGRESS_EXIT_ENABLED", "1" if is_mid else "0").strip().lower() not in ("0","false","no","off"))
-                    NO_PROGRESS_MIN_AGE_SEC = _env_float_mid("SMART_NO_PROGRESS_MIN_AGE_SEC", 30.0 * 60.0, is_mid)
-                    NO_PROGRESS_MIN_BEST_TP1_PROGRESS = _env_float_mid("SMART_NO_PROGRESS_MIN_BEST_TP1_PROGRESS", 0.35, is_mid)
-                    NO_PROGRESS_MAX_LOSS_PCT = _env_float_mid("SMART_NO_PROGRESS_MAX_LOSS_PCT", 0.85, is_mid)
-
                     # Post-entry invalidation BEFORE SL (allows early exit in a small loss / tiny profit)
                     INVALIDATION_EXIT_ENABLED = (os.getenv("SMART_INVALIDATION_EXIT_ENABLED", "1" if is_mid else "0").strip().lower() not in ("0","false","no","off"))
                     INVALIDATION_MIN_BARS = _env_int_mid("SMART_INVALIDATION_MIN_5M_BARS", 1, is_mid)
@@ -10579,61 +10047,6 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         else:
                             fail_reason = _sm_reason_execution_error(weakness_close_error or last_close_explain or _sm_reason_close_returned_false())
                             await _notify_smart_decision("WEAKNESS", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=fail_reason, cooldown_sec=15.0)
-
-                    if NO_PROGRESS_EXIT_ENABLED and is_mid and entry_p > 0 and tp1 > 0 and (not tp1_seen):
-                        try:
-                            if direction == "LONG":
-                                best_progress_live = (float(best_px) - float(entry_p)) / max(float(tp1) - float(entry_p), 1e-12)
-                                loss_now_live = max(0.0, (1.0 - float(px) / max(float(entry_p), 1e-12)) * 100.0)
-                            else:
-                                best_progress_live = (float(entry_p) - float(best_px)) / max(float(entry_p) - float(tp1), 1e-12)
-                                loss_now_live = max(0.0, (float(px) / max(float(entry_p), 1e-12) - 1.0) * 100.0)
-                            best_progress_live = max(0.0, min(2.0, float(best_progress_live)))
-                        except Exception:
-                            best_progress_live = 0.0
-                            loss_now_live = 0.0
-                        no_progress_due = bool(
-                            float(open_age_sec or 0.0) >= float(NO_PROGRESS_MIN_AGE_SEC)
-                            and best_progress_live < float(NO_PROGRESS_MIN_BEST_TP1_PROGRESS)
-                            and float(loss_now_live) <= float(NO_PROGRESS_MAX_LOSS_PCT)
-                        )
-                        if no_progress_due:
-                            no_progress_err = ""
-                            no_progress_reason = (
-                                f"No-progress time stop: age={float(open_age_sec or 0.0)/60.0:.1f}m, "
-                                f"best_progress_to_TP1={best_progress_live:.2f}R < {float(NO_PROGRESS_MIN_BEST_TP1_PROGRESS):.2f}R, "
-                                f"loss_now={float(loss_now_live):.2f}%"
-                            )
-                            close_ok = False
-                            try:
-                                close_ok = await _close_market(qty)
-                            except Exception as e:
-                                no_progress_err = str(e)
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] no-progress close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
-                            if close_ok:
-                                await _notify_smart_decision(
-                                    "TIME",
-                                    "CLOSED",
-                                    level_label="TP1",
-                                    level_price=tp1 if tp1 > 0 else px,
-                                    reason=_sm_join_reason(no_progress_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)),
-                                    cooldown_sec=5.0,
-                                )
-                                await _mark_local_full_close("NO_PROGRESS_TIME_STOP", tp1_hit=False)
-                                pnl_usdt, roi_percent = _smart_close_snapshot()
-                                await db_store.close_autotrade_position(
-                                    user_id=uid,
-                                    signal_id=r.get("signal_id"),
-                                    exchange=ex,
-                                    market_type=mt,
-                                    status="CLOSED",
-                                    pnl_usdt=pnl_usdt,
-                                    roi_percent=roi_percent,
-                                    row_id=int(r.get("id") or 0),
-                                )
-                                continue
-                            else:
-                                await _notify_smart_decision("TIME", "NOT CLOSED", level_label="TP1", level_price=tp1 if tp1 > 0 else px, reason=_sm_reason_execution_error(no_progress_err or last_close_explain or _sm_reason_close_returned_false()), cooldown_sec=15.0)
 
                     invalidation_eval = None
                     if INVALIDATION_EXIT_ENABLED and is_mid and mt == "futures" and entry_p > 0 and (not tp1_seen):
@@ -14392,7 +13805,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # Toggle:
         #   MID_PENDING_ENABLED=1
         #   MID_PENDING_SKIP_HARDBLOCKS=1   (default)
-        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
         _pending_skip_hb = os.getenv("MID_PENDING_SKIP_HARDBLOCKS", "1").strip().lower() not in ("0", "false", "no", "off")
         # When user wants *all* filters only after setup, we skip all hardblocks during the SCAN phase.
         # On TRIGGER phase we must enforce the filters again.
@@ -17569,7 +16982,7 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
         if not _mid_bool_env("MID_SCAN_HARDBLOCK_RSI_ADX", "1"):
             return None
 
-        if not (_mid_bool_env("MID_PENDING_ENABLED", "1") and _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")):
+        if not (_mid_bool_env("MID_PENDING_ENABLED", "0") and _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")):
             return None
 
         try:
@@ -18606,7 +18019,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         use_bort = _mid_bool_env("MID_USE_BREAKOUT_RETEST", "1")
         use_ob = _mid_bool_env("MID_USE_ORDER_BLOCK", "1")
         require_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER", "1")
-        pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "1")
+        pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "0")
         postsetup_only = _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")
 
         if use_regime:
@@ -19235,7 +18648,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         if contradiction_reason:
             contradiction_block_reason = str(contradiction_reason)
             try:
-                _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+                _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
                 _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                 _phase_now = str(_phase or "scan").lower()
                 _defer_to_trigger = bool(_pending_enabled and _postsetup_only and _phase_now == "scan")
@@ -19451,7 +18864,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mkt_u2 = str(market or "SPOT").upper()
         min_score = int(os.getenv("MID_MIN_SCORE_SPOT", "76")) if mkt_u2 == "SPOT" else int(os.getenv("MID_MIN_SCORE_FUTURES", "72"))
         if min_score > 0 and int(confidence) < int(min_score):
-            _pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+            _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
             _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
             _phase = "scan"
             try:
@@ -26113,72 +25526,6 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 if not ok_guard:
                     removed += 1
                     continue
-
-                # v62: do not let old pending records created by older policy versions
-                # live forever. Pending is only for early/temporary waits. Terminal
-                # reasons are purged at load, and waitable records expire by a
-                # shorter waitable age rather than the generic long TTL.
-                try:
-                    if str(os.getenv("MID_PENDING_PURGE_POLICY_ON_LOAD", "1") or "1").strip().lower() in ("1", "true", "yes", "on"):
-                        _reason_blob = " | ".join([
-                            str(it.get("pending_wait_reason") or ""),
-                            str(it.get("last_fail_reason") or ""),
-                            str(it.get("pending_kill_policy") or ""),
-                            str(it.get("pending_wait_policy") or ""),
-                            str(it.get("pending_early_policy") or ""),
-                        ])
-                        _rk, _rp = _mid_pending_reason_policy(_reason_blob) if _reason_blob.strip() else (True, "no_policy_reason")
-                        # Explicit hard/terminal kill reasons should remove old zombie pending.
-                        if _reason_blob.strip() and (not _rk) and str(_rp or "").startswith("kill:") and str(_rp) not in ("kill:not_waitable", "kill:policy_error"):
-                            removed += 1
-                            continue
-
-                        # If this is a waitable clean-path/acceptance pending, require it
-                        # to still be an early-save candidate and respect the shorter
-                        # waitable lifetime.
-                        if _reason_blob.strip() and bool(_rk):
-                            _ek, _en = _mid_pending_is_early_save_candidate(it, _reason_blob, _rp)
-                            if not _ek:
-                                removed += 1
-                                continue
-                            try:
-                                _age_m2 = max(0.0, (float(now_ts) - float(created_ts or now_ts)) / 60.0)
-                            except Exception:
-                                _age_m2 = 0.0
-                            try:
-                                _mkt2 = str(it.get("market") or "").upper().strip()
-                                _max_age2 = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN", "35") if _mkt2 == "FUTURES" else os.getenv("MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN", "45"))
-                            except Exception:
-                                _max_age2 = 45.0
-                            if _max_age2 > 0 and _age_m2 >= _max_age2:
-                                removed += 1
-                                continue
-
-                        # Legacy pendings without v61 early marker but already old are
-                        # removed unless they are clearly a fresh BO/RT or structure-pending idea.
-                        if not str(it.get("pending_early_policy") or "").strip():
-                            try:
-                                _orphan_max = float(os.getenv("MID_PENDING_ORPHAN_MAX_AGE_MIN", "35") or 35.0)
-                                _age_m3 = max(0.0, (float(now_ts) - float(created_ts or now_ts)) / 60.0)
-                            except Exception:
-                                _orphan_max, _age_m3 = 35.0, 0.0
-                            if _orphan_max > 0 and _age_m3 >= _orphan_max:
-                                _route_txt3 = " ".join([
-                                    str(it.get("smc_setup_route") or ""),
-                                    str(it.get("emit_route") or ""),
-                                    str(it.get("smart_setup") or ""),
-                                    str(it.get("setup") or ""),
-                                    str(it.get("risk_note") or ""),
-                                ]).lower()
-                                _is_sp3 = ("structure pending" in _route_txt3) or ("structure_pending" in _route_txt3) or ("pending trigger" in _route_txt3)
-                                _bo_txt3 = str(it.get("bo_rt") or it.get("breakout_retest") or "").upper()
-                                _has_bo3 = ("BO" in _bo_txt3 and "RT" in _bo_txt3)
-                                if not (_is_sp3 or _has_bo3):
-                                    removed += 1
-                                    continue
-                except Exception:
-                    pass
-
                 out.append(it)
             return out, removed
 
@@ -26353,7 +25700,7 @@ async def _mid_get_active_trade(self, symbol: str, market: str = "") -> dict | N
         return None
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
-    enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+    enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
     if not enabled:
         return
     poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
@@ -26438,53 +25785,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         except Exception:
             pass
 
-    def _pending_recheck_gap_sec(reason: str = "", it: dict | None = None) -> float:
-        """Return when a WAIT pending should be rechecked again.
-
-        v66: use an explicit next_check timestamp instead of relying only on
-        last_attempt_ts. In production logs v65 still rechecked quality-first
-        WAIT items every poll because the instant-emit branch touched them often.
-        This keeps early pending useful but stops 5-7s recheck spam.
-        """
-        try:
-            default_gap = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "30") or 30.0)
-        except Exception:
-            default_gap = 30.0
-        try:
-            min_gap = float(os.getenv("MID_PENDING_MIN_RECHECK_SEC", "20") or 20.0)
-        except Exception:
-            min_gap = 20.0
-        try:
-            max_gap = float(os.getenv("MID_PENDING_MAX_RECHECK_SEC", "45") or 45.0)
-        except Exception:
-            max_gap = 45.0
-        gap = max(min_gap, default_gap)
-        r = str(reason or "")
-        rl = r.lower()
-        # If we're only waiting for the mandatory zone/retest hold, recheck near
-        # the remaining hold time instead of sleeping a full debounce interval.
-        try:
-            import re as _re
-            m = _re.search(r"(?:zone_hold|retest_hold)=(\d+(?:\.\d+)?)s<(?P<need>\d+(?:\.\d+)?)s", r)
-            if m:
-                cur = float(m.group(1))
-                need = float(m.group('need'))
-                gap = max(2.0, min(max_gap, need - cur + 1.0))
-        except Exception:
-            pass
-        # For clean-path / acceptance waits, avoid hammering the same symbol.
-        if "clean_path" in rl or "no_acceptance" in rl or "no_breakdown" in rl or "wall_wait" in rl:
-            gap = max(gap, min_gap)
-        return max(1.0, min(float(max_gap), float(gap)))
-
-    def _pending_set_next_recheck(it: dict, now_ts: float, reason: str = "") -> None:
-        try:
-            gap = _pending_recheck_gap_sec(reason, it)
-            it["pending_next_check_ts"] = float(now_ts) + float(gap)
-            it["pending_recheck_gap_sec"] = float(gap)
-        except Exception:
-            pass
-
     def _pending_clear_cooldown(it: dict) -> None:
         """Allow re-adding a pending immediately after it's removed/expired/emitted.
         Clears the in-memory MID_PENDING_COOLDOWN key for this symbol+dir+market.
@@ -26507,116 +25807,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     def _pending_apply_fail(it: dict, reason: str, now_ts: float) -> tuple[bool, str]:
         """Update pending fail bookkeeping and return (keep, outcome).
 
-        outcome is one of: 'wait', 'soft_fail', 'hard_fail'.
+        outcome is one of: 'soft_fail', 'hard_fail'.
 
-        v60 strict pending lifecycle:
-        - WAITABLE quality reasons stay pending until a real better point appears.
-          They do NOT die just because the loop checked them many times.
-        - KILL reasons are removed immediately, including old/zombie pendings created
-          by previous versions.
-        - Generic soft checks keep the old behavior.
+        Smart delete policy:
+        - HARD reasons -> drop immediately (terminal invalidation)
+        - SOFT reasons -> keep waiting (do not increment fail_count), but still enforce max_attempts
+        - Default -> counts as fail and is subject to caps
         """
-        r_raw = str(reason or "fail").strip()
-        r0 = r_raw.lower()
+        r0 = str(reason or "fail").strip().lower()
 
-        # v60: apply the same WAIT/KILL policy during trigger rechecks, not only when
-        # creating a pending. This purges old pending zombies like directional_contradiction,
-        # tp1_too_close and sl_too_tight, while keeping clean_path/acceptance waits alive.
-        try:
-            _policy_keep, _policy_note = _mid_pending_reason_policy(r_raw)
-        except Exception:
-            _policy_keep, _policy_note = (False, "kill:policy_error")
-
-        try:
-            if bool(_policy_keep):
-                # v61: Even a waitable quality reason is kept only when the pending
-                # is a genuinely early trigger waiting for acceptance/breakdown.
-                # Old/stale/non-structure clean-path waits are removed so the queue
-                # does not become a warehouse of every rejected setup.
-                try:
-                    _early_keep, _early_note = _mid_pending_is_early_save_candidate(it, r_raw, _policy_note)
-                except Exception:
-                    _early_keep, _early_note = (False, "not_early:policy_error")
-                if not _early_keep:
-                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                    it["last_fail_reason"] = f"pending_not_early:{r_raw}"[:300]
-                    it["last_fail_ts"] = float(now_ts)
-                    it["pending_early_policy"] = str(_early_note)
-                    _pending_clear_cooldown(it)
-                    return (False, "hard_fail")
-
-                it["last_fail_reason"] = r_raw or "quality_wait"
-                it["last_fail_ts"] = float(now_ts)
-                it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
-                it["quality_wait_ts"] = float(now_ts)
-                it["pending_wait_policy"] = str(_policy_note)
-                it["pending_early_policy"] = str(_early_note)
-
-                # Do not use trigger_attempts as a hard kill for WAITABLE reasons.
-                # The loop can poll every few seconds, so attempts can grow fast while
-                # the idea is still simply waiting for acceptance/breakdown.
-                try:
-                    created_ts = float(it.get("created_ts") or now_ts or 0.0)
-                    age_m = max(0.0, (float(now_ts) - created_ts) / 60.0) if created_ts > 0 else 0.0
-                except Exception:
-                    age_m = 0.0
-                try:
-                    mkt_u = str(it.get("market") or "").upper().strip()
-                    if mkt_u == "FUTURES":
-                        max_age_m = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_FUTURES_MIN", "35") or 35.0)
-                    else:
-                        max_age_m = float(os.getenv("MID_PENDING_WAITABLE_MAX_AGE_SPOT_MIN", "45") or 45.0)
-                except Exception:
-                    max_age_m = 45.0
-                try:
-                    max_q_wait = int(os.getenv("MID_PENDING_WAITABLE_MAX_CHECKS", "80") or 80)
-                except Exception:
-                    max_q_wait = 80
-
-                if max_age_m > 0 and age_m >= max_age_m:
-                    it["last_fail_reason"] = f"waitable_expired:{r_raw}"[:300]
-                    _pending_clear_cooldown(it)
-                    return (False, "hard_fail")
-                if max_q_wait > 0 and int(it.get("quality_wait_count") or 0) >= max_q_wait:
-                    it["last_fail_reason"] = f"waitable_checks_expired:{r_raw}"[:300]
-                    _pending_clear_cooldown(it)
-                    return (False, "hard_fail")
-                _pending_set_next_recheck(it, now_ts, r_raw)
-                return (True, "wait")
-
-            # Only explicit terminal policies kill immediately. Generic not_waitable keeps
-            # legacy handling below so ordinary soft filters don't become too aggressive.
-            if str(_policy_note or "").startswith("kill:") and str(_policy_note) not in ("kill:not_waitable", "kill:policy_error"):
-                it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                it["last_fail_reason"] = r_raw or "policy_kill"
-                it["last_fail_ts"] = float(now_ts)
-                it["pending_kill_policy"] = str(_policy_note)
-                _pending_clear_cooldown(it)
-                return (False, "hard_fail")
-        except Exception:
-            pass
-
-        # v57 quality-first pending compatibility: if a legacy caller still passes a
-        # waitable full reason, keep it pending.
-        try:
-            if str(os.getenv("MID_V57_QUALITY_GUARD_KEEP_PENDING", "1") or "1").strip().lower() in ("1", "true", "yes", "on") and _mid_is_waitable_final_emit_reason(str(reason or "")):
-                _early_keep, _early_note = _mid_pending_is_early_save_candidate(it, str(reason or ""), "compat_wait")
-                if not _early_keep:
-                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                    it["last_fail_reason"] = f"pending_not_early:{str(reason or '')}"[:300]
-                    it["last_fail_ts"] = float(now_ts)
-                    it["pending_early_policy"] = str(_early_note)
-                    _pending_clear_cooldown(it)
-                    return (False, "hard_fail")
-                it["last_fail_reason"] = str(reason or "quality_wait")
-                it["last_fail_ts"] = float(now_ts)
-                it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
-                it["quality_wait_ts"] = float(now_ts)
-                it["pending_early_policy"] = str(_early_note)
-                _pending_set_next_recheck(it, now_ts, str(reason or ""))
-                return (True, "wait")
-        except Exception:
-            pass
 
         # Special case: direction_mismatch is *soft* by default (only used on strong reversals).
         # This can be disabled to let it fall back to the generic soft/hard lists.
@@ -26630,7 +25829,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                         _pending_clear_cooldown(it)
                         return (False, "hard_fail")
-                    _pending_set_next_recheck(it, now_ts, str(reason or ""))
                     return (True, "soft_fail")
         except Exception:
             pass
@@ -26660,7 +25858,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,quality_guard,late_entry,macd_hist,anti_bounce").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
@@ -26669,7 +25867,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                     _pending_clear_cooldown(it)
                     return (False, "hard_fail")
-                _pending_set_next_recheck(it, now_ts, str(reason or ""))
                 return (True, "soft_fail")
         except Exception:
             pass
@@ -26688,15 +25885,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _pending_clear_cooldown(it)
                 return (False, "hard_fail")
         except Exception:
-            try:
-                _pending_set_next_recheck(it, now_ts, str(reason or ""))
-            except Exception:
-                pass
             return (True, "soft_fail")
-        try:
-            _pending_set_next_recheck(it, now_ts, str(reason or ""))
-        except Exception:
-            pass
         return (True, "soft_fail")
 
     def _pending_log_trigger(sym: str, market: str, direction: str, outcome: str, reason: str, it: dict, price: float) -> None:
@@ -27197,26 +26386,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     created = float(it.get("created_ts") or 0.0) or now
                     if not sym or entry0 <= 0:
                         continue
-
-                    # v63: purge zombie pendings before any zone_hold/wait path.
-                    # This removes old rows with terminal raw reasons and expires waitable rows
-                    # even when they never reach final_emit_gate again.
-                    try:
-                        _purge_reason = _mid_pending_record_purge_reason(it, now)
-                    except Exception:
-                        _purge_reason = ""
-                    if _purge_reason:
-                        try:
-                            logger.info("[mid][pending][purge] %s %s %s reason=%s age_m=%.1f attempts=%s fails=%s", sym, market, direction, _purge_reason, max(0.0, (float(now) - float(created or now)) / 60.0), int(it.get("trigger_attempts") or 0), int(it.get("fail_count") or 0))
-                        except Exception:
-                            pass
-                        try:
-                            removed_n += 1
-                        except Exception:
-                            pass
-                        _pending_clear_cooldown(it)
-                        continue
-
                     # expire
                     ttl_item = float(it.get("ttl_min") or ttl_min)
                     if (now - created) > ttl_item * 60:
@@ -27671,60 +26840,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # In that debug mode, debounce must NOT suppress the emit, otherwise pendings can appear
                     # to "never reach trigger" (no [mid][pending][trigger] logs) while sitting in-zone.
                     try:
-                        entered_zone_now = bool(it.get("_entered_zone_now") or False)
-                        # v66 hard debounce: once a pending returned WAIT, store a
-                        # pending_next_check_ts and do not re-run heavy checks until then.
-                        # This works even when quality_first suppresses instant emit.
-                        try:
-                            _next_check_ts = float(it.get("pending_next_check_ts") or 0.0)
-                        except Exception:
-                            _next_check_ts = 0.0
-                        if _next_check_ts > 0 and (not entered_zone_now) and now < _next_check_ts:
-                            try:
-                                logger.info(
-                                    "[mid][pending][debounce_wait] %s %s %s age_m=%.1f next_check_in=%.0fs reason=next_check_ts",
-                                    sym, market, direction,
-                                    max(0.0, (now - float(it.get("created_ts") or now)) / 60.0),
-                                    max(0.0, _next_check_ts - now),
-                                )
-                            except Exception:
-                                pass
-                            keep.append(it)
-                            any_wait = True
-                            continue
                         last_try = float(it.get("last_attempt_ts") or 0.0)
+                        entered_zone_now = bool(it.get("_entered_zone_now") or False)
                         # Re-check trigger while price remains inside the zone.
                         # This fixes the case where a symbol entered the zone once, stayed in-zone,
                         # and never got another trigger pass because the code only effectively acted
                         # like an edge-trigger. By default we allow re-check on every poll while
                         # in-zone; users can throttle it with MID_PENDING_RECHECK_IN_ZONE_SEC.
-                        recheck_in_zone_sec = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "30") or 30)
-                        # v65: debounce must still work when MID_PENDING_INSTANT_EMIT=1
-                        # but quality_first suppresses that bypass. In v64, the condition
-                        # `(not pending_instant_emit)` disabled debounce, so WAIT items were
-                        # rechecked every poll (~5-6s) and spammed final_emit_wait logs.
-                        # Only skip debounce when instant emit can actually bypass checks.
-                        try:
-                            _instant_bypass_allowed_now = bool(
-                                pending_instant_emit
-                                and (instant_ignore_zone or pending_emit_on_zone or instant_emit_due_to_nofilters or pending_skip_checks)
-                                and (not _mid_quality_first_enabled())
-                            )
-                        except Exception:
-                            _instant_bypass_allowed_now = False
-
-                        if (not instant_emit_due_to_nofilters) and (not _instant_bypass_allowed_now) and last_try > 0:
+                        recheck_in_zone_sec = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "0") or 0)
+                        if (not instant_emit_due_to_nofilters) and (not pending_instant_emit) and last_try > 0:
                             if bool(it.get("_in_zone") or it.get("_in_zone_tol") or False):
                                 if (not entered_zone_now) and recheck_in_zone_sec > 0 and (now - last_try) < recheck_in_zone_sec:
-                                    try:
-                                        logger.info(
-                                            "[mid][pending][debounce_wait] %s %s %s age_m=%.1f next_check_in=%.0fs reason=recheck_in_zone_sec",
-                                            sym, market, direction,
-                                            max(0.0, (now - float(it.get("created_ts") or now)) / 60.0),
-                                            max(0.0, recheck_in_zone_sec - (now - last_try)),
-                                        )
-                                    except Exception:
-                                        pass
                                     keep.append(it)
                                     any_wait = True
                                     continue
@@ -27923,10 +27049,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _final_emit_reason:
                                     _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                     try:
-                                        logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
+                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
                                     except Exception:
                                         pass
                                     if keep_it:
@@ -27955,7 +27081,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _pre_emit_reason:
                                     _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                     try:
                                         logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_instant_emit", _pre_emit_reason)
@@ -28348,10 +27474,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                 )
                                                 if _touch_final_reason:
                                                     _apply_reason = _mid_final_emit_apply_reason(_touch_final_reason)
-                                                    keep_it, outc = _pending_apply_fail(it, _touch_final_reason, now)
+                                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                                     _pending_log_trigger(sym, market, direction, outc, _touch_final_reason, it, float(price))
                                                     try:
-                                                        logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _touch_final_reason)
+                                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _touch_final_reason)
                                                     except Exception:
                                                         pass
                                                     if keep_it:
@@ -28382,7 +27508,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                     )
                                                     if _pre_emit_reason:
                                                         _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                                        keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
+                                                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                                         _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                                         try:
                                                             logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "zone_touch_emit", _pre_emit_reason)
@@ -28869,10 +27995,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             )
                             if _final_emit_reason:
                                 _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                                keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
+                                keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                 _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                                 try:
-                                    logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
+                                    logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
                                 except Exception:
                                     pass
                                 if keep_it:
@@ -28927,7 +28053,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 )
                                 if _pre_emit_reason:
                                     _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                                    keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                                     _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                     try:
                                         logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "instant_emit_vip", _pre_emit_reason)
@@ -30448,10 +29574,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     )
                     if _final_emit_reason:
                         _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
-                        keep_it, outc = _pending_apply_fail(it, _final_emit_reason, now)
+                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                         _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                         try:
-                            logger.info("[mid][pending][final_emit_%s] %s %s %s reason=%s", ("wait" if keep_it else "kill"), sym, market, direction, _final_emit_reason)
+                            logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
                         except Exception:
                             pass
                         if keep_it:
@@ -30520,7 +29646,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     )
                     if _pre_emit_reason:
                         _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
-                        keep_it, outc = _pending_apply_fail(it, _pre_emit_reason, now)
+                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
                         _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                         try:
                             logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_confirmed_emit", _pre_emit_reason)
@@ -31390,7 +30516,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             # Railway env is a common source of "it should be 1 but behaves like 0" issues.
             # Log the effective flags and key thresholds once per tick.
             try:
-                pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "1") or "0").strip().lower() not in ("0","false","no","off")
+                pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
                 postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "1") or "0").strip().lower() not in ("0","false","no","off")
                 require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
                 min_conf = 0  # confidence filter removed permanently
@@ -33465,7 +32591,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         best_name, best_r = chosen_name, chosen_r
                         base_r = best_r
                         # Mode switch: create setups first, apply filters later at trigger.
-                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
                         postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                         scan_soft = bool(pending_enabled and postsetup_only)
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
@@ -33877,7 +33003,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         ts=time.time(),
                         )
                         # If MID_PENDING_ENABLED=1: save setup and emit ONLY when price reaches entry + TA reconfirmed.
-                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
                         if pending_enabled:
                             try:
                                 # Normalize direction/market (avoid Enum-ish strings like 'Direction.SHORT')
@@ -35421,115 +34547,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 logger.info("[mid][liq_reclaim][skip] %s market=%s dir=%s reason=%s", sym, marketu, diru, str(_liq_reason or "not_ready"))
                                             except Exception:
                                                 pass
-
-                                    # v59: strict pending policy.
-                                    # Keep only live WAIT cases in pending.  Terminal/hard blocks must not
-                                    # become zombie pending setups that may emit later from a bad idea.
-                                    try:
-                                        _pending_policy_reason = ""
-                                        _pending_reason_parts = []
-                                        try:
-                                            _pending_reason_parts.append(str(rec.get("smart_emit_reason") or ""))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _sem = rec.get("smart_emit_meta") if isinstance(rec, dict) else None
-                                            if isinstance(_sem, dict):
-                                                _pending_reason_parts.append(str(_sem.get("primary_reason") or ""))
-                                                _pending_reason_parts.append(str(_sem.get("all_reasons") or ""))
-                                                _pending_reason_parts.append(str(_sem.get("final_emit_kill") or ""))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _pending_reason_parts.append(str(locals().get("_smart_pending_reason") or ""))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _lm = locals().get("_emit_meta")
-                                            if isinstance(_lm, dict):
-                                                _pending_reason_parts.append(str(_lm.get("primary_reason") or ""))
-                                                _pending_reason_parts.append(str(_lm.get("all_reasons") or ""))
-                                                _pending_reason_parts.append(str(_lm.get("final_emit_kill") or ""))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            if "base_r" in locals() and isinstance(base_r, dict):
-                                                _pending_reason_parts.append(str(base_r.get("block_reason") or ""))
-                                                _pending_reason_parts.append(str(base_r.get("trap_reason") or ""))
-                                                _pending_reason_parts.append(str(base_r.get("reject_reason") or ""))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _pending_reason_parts.extend([str(x) for x in (risk_flags or [])])
-                                        except Exception:
-                                            pass
-                                        _pending_policy_reason = " | ".join([x for x in _pending_reason_parts if str(x).strip()])
-                                        # Only enforce this on setups that were blocked by a smart/final gate.
-                                        # Empty/normal pendings can still be created by the old zone-wait flow.
-                                        _smart_blocked_for_pending = False
-                                        try:
-                                            _smart_blocked_for_pending = bool(rec.get("smart_setup")) and not bool(rec.get("smart_emit_now"))
-                                        except Exception:
-                                            _smart_blocked_for_pending = False
-                                        if _smart_blocked_for_pending and _pending_policy_reason:
-                                            _keep_pending, _policy_note = _mid_pending_reason_policy(_pending_policy_reason)
-                                            if not _keep_pending:
-                                                try:
-                                                    logger.info(
-                                                        "[mid][pending][kill_not_waitable] %s %s %s policy=%s reason=%s",
-                                                        sym, marketu, diru, str(_policy_note), str(_pending_policy_reason)[:700],
-                                                    )
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    _pending_skip(sym, f"pending_kill:{str(_policy_note)}")
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    _rej_add(sym, f"pending_kill:{str(_policy_note)}")
-                                                except Exception:
-                                                    pass
-                                                continue
-                                            else:
-                                                # v61: WAITABLE does not automatically mean "store".
-                                                # Store only genuinely early ideas that may improve after
-                                                # acceptance/breakdown; do not keep every blocked setup.
-                                                _early_keep, _early_note = _mid_pending_is_early_save_candidate(rec, _pending_policy_reason, _policy_note)
-                                                if not _early_keep:
-                                                    try:
-                                                        logger.info(
-                                                            "[mid][pending][kill_not_early] %s %s %s policy=%s early=%s reason=%s",
-                                                            sym, marketu, diru, str(_policy_note), str(_early_note), str(_pending_policy_reason)[:700],
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                                    try:
-                                                        _pending_skip(sym, f"pending_kill:{str(_early_note)}")
-                                                    except Exception:
-                                                        pass
-                                                    try:
-                                                        _rej_add(sym, f"pending_kill:{str(_early_note)}")
-                                                    except Exception:
-                                                        pass
-                                                    continue
-                                                try:
-                                                    rec["pending_wait_policy"] = str(_policy_note)
-                                                    rec["pending_wait_reason"] = str(_pending_policy_reason)[:700]
-                                                    rec["pending_early_policy"] = str(_early_note)
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    logger.info(
-                                                        "[mid][pending][keep_early_waitable] %s %s %s policy=%s early=%s reason=%s",
-                                                        sym, marketu, diru, str(_policy_note), str(_early_note), str(_pending_policy_reason)[:700],
-                                                    )
-                                                except Exception:
-                                                    pass
-                                    except Exception as _pending_policy_exc:
-                                        try:
-                                            logger.info("[mid][pending][policy_error] %s %s %s err=%s", sym, marketu, diru, type(_pending_policy_exc).__name__)
-                                        except Exception:
-                                            pass
 
                                     await self.add_mid_pending(rec)
                                     try:
