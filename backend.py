@@ -3269,6 +3269,36 @@ def _mid_report_path_quality_guard_reason(
                         f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
                     )
 
+                # v56: small-TP fallback when the TA snapshot did not expose a clean
+                # scalar resistance level.  The May 8 STORJ/CAKE losses had TP1 only
+                # about 0.9-1.0% away, but the entry was still under a micro seller
+                # reaction and did not have real continuation.  If there is no strong
+                # continuation, do not let a tiny target pass just because the wall key
+                # is missing from ta/gate_meta.
+                try:
+                    small_tp_missing_wall_move_atr = float(os.getenv("MID_REPORT_PATH_SMALL_TP_MISSING_WALL_MOVE_ATR", "0.55") or 0.55)
+                except Exception:
+                    small_tp_missing_wall_move_atr = 0.55
+                missing_wall_small_tp_trap = bool(
+                    clean_space_pct <= float(review_clean_pct)
+                    and no_accept
+                    and weak_long_reaction
+                    and not real_bull_continuation
+                    and (
+                        (not levels_over)
+                        or local_top_bad
+                        or range_bad
+                        or late_from_low >= float(small_tp_missing_wall_move_atr)
+                        or (recent_high > entry and pullback_from_high_atr >= 0.06)
+                    )
+                )
+                if missing_wall_small_tp_trap:
+                    return (
+                        f"quality_path_long_small_tp_no_acceptance:side=LONG|clean={clean_space_pct*100:.2f}%"
+                        f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                        f"|late_atr={late_from_low:.2f}|levels={len(levels_over)}"
+                    )
+
             if micro_tp_wall and not real_bull_continuation:
                 return (
                     f"quality_path_micro_wall_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
@@ -3349,6 +3379,66 @@ def _mid_report_path_quality_guard_reason(
                     f"quality_path_structure_pending_micro_top_blocked:side=LONG|clean={clean_space_pct*100:.2f}%"
                     f"|pullback_atr={pullback_from_high_atr:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
                     f"|body_atr={bv:.2f}|vol={rv:.2f}"
+                )
+
+            # v56: the v55 guard was too narrow for LINEA/NEAR-style losses.
+            # It only blocked clean_space<=1.20% or fake RR>=4, so a LONG taken
+            # after a mature pump with TP1 2-3% away could pass, especially when
+            # fresh_momentum_ok was true only because price was near the recent high.
+            # Block late LONGs in the upper local range unless there is real acceptance
+            # above the seller reaction / local top.
+            try:
+                late_pump_review_min_atr = float(os.getenv("MID_REPORT_PATH_LATE_PUMP_REVIEW_ATR", "1.10") or 1.10)
+            except Exception:
+                late_pump_review_min_atr = 1.10
+            try:
+                late_pump_review_max_tp_pct = float(os.getenv("MID_REPORT_PATH_LATE_PUMP_MAX_TP1_PCT", "3.50") or 3.50) / 100.0
+            except Exception:
+                late_pump_review_max_tp_pct = 0.035
+            try:
+                late_pump_reject_wick_atr = float(os.getenv("MID_REPORT_PATH_LATE_PUMP_REJECT_WICK_ATR", "0.08") or 0.08)
+            except Exception:
+                late_pump_reject_wick_atr = 0.08
+            strict_bull_acceptance = bool(
+                strong_accept
+                or (
+                    level_value > 0
+                    and close > (level_value + pad_abs)
+                    and float(close_pos_5m) >= 0.70
+                    and not bool(two_red_now)
+                    and float(upper_wick_atr_5m) <= 0.25
+                    and (bv >= float(fresh_body_atr) or rv >= float(fresh_vol_x) or macd_v > 0)
+                )
+            )
+            late_pump_dirty_path = bool(
+                level_before_tp1
+                or tp1_blocked
+                or near_level
+                or local_top_bad
+                or range_bad
+                or pulled_back_from_local_high
+            )
+            late_pump_weak_reaction = bool(
+                weak_micro_followthrough
+                or bool(two_red_now)
+                or float(upper_wick_atr_5m) >= float(late_pump_reject_wick_atr)
+                or float(close_pos_5m) < 0.72
+                or (rv > 0 and rv < 0.75)
+            )
+            late_pump_no_accept = bool(
+                review_guard_v55
+                and clean_space_pct <= float(late_pump_review_max_tp_pct)
+                and late_from_low >= float(late_pump_review_min_atr)
+                and no_accept
+                and late_pump_dirty_path
+                and late_pump_weak_reaction
+                and not strict_bull_acceptance
+            )
+            if late_pump_no_accept:
+                return (
+                    f"quality_path_late_long_after_pump_no_acceptance:side=LONG|clean={clean_space_pct*100:.2f}%"
+                    f"|late_atr={late_from_low:.2f}|range_pos={float(rpos):.2f}|pullback_atr={pullback_from_high_atr:.2f}"
+                    f"|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}|fast={int(bool(fast_continuation_ok))}"
                 )
 
             if strong_accept or fast_continuation_ok:
