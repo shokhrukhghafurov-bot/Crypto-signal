@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-11_v55_pump_followthrough_guard"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_v54_fast_continuation_rsi_relief"
 
 import asyncio
 import json
@@ -1360,8 +1360,6 @@ MID_REJECT_ALIASES = {
     # filters
     "late_entry": "late_entry",
     "late_entry_atr": "late_entry",
-    "late_impulse": "late_entry",
-    "late_impulse_no_pullback": "late_entry",
     "vwap_dist": "vwap_dist",
     "vwap_dist_atr": "vwap_dist",
     "vwap_bias": "vwap_dist",
@@ -1406,8 +1404,6 @@ MID_REJECT_ALIASES = {
     "structure": "structure_fail",
     "bos": "structure_fail",
     "choch": "structure_fail",
-    "followthrough_missing": "structure_fail",
-    "followthrough_weak_volume": "structure_fail",
 
     # Report-driven smart path guard: blocks entries that match repeated SL patterns
     # from the manual chart review (TP1 behind resistance/support, late entry, no acceptance).
@@ -2679,185 +2675,6 @@ def _mid_futures_short_weak_emit_reason(*,
 
 
 
-def _mid_get_emit_side(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
-    """Best-effort side extractor for trigger/emit guards."""
-    try:
-        side = str(
-            (getattr(sig, "direction", None) if sig is not None else None)
-            or (ta or {}).get("direction")
-            or (it or {}).get("direction")
-            or ""
-        ).upper().strip()
-        return side if side in ("LONG", "SHORT") else ""
-    except Exception:
-        return ""
-
-
-def _mid_num_from_sources(*vals, default: float = 0.0) -> float:
-    """Small local helper for final emit guards; never raises."""
-    for v in vals:
-        try:
-            if v is None or v == "" or v == "—":
-                continue
-            fv = _safe_float(v, None)
-            if fv is None:
-                continue
-            return float(fv)
-        except Exception:
-            continue
-    return float(default)
-
-
-def _mid_trigger_followthrough_reason(*,
-                                      sig=None,
-                                      ta: dict | None = None,
-                                      it: dict | None = None,
-                                      route: str | None = None,
-                                      body_atr: float | None = None,
-                                      vol_x: float | None = None) -> str:
-    """Require one real direction-confirming 5m candle before emit.
-
-    This implements the user's manual review rule: do not enter immediately after
-    a formal trigger unless the trigger candle actually follows through.  It is a
-    pre-entry confirmation proxy for the recurring LOSS pattern "no post-entry
-    expansion".
-    """
-    try:
-        if not _env_bool("MID_REQUIRE_TRIGGER_FOLLOWTHROUGH", True):
-            return ""
-        t = ta if isinstance(ta, dict) else {}
-        rec = it if isinstance(it, dict) else {}
-        side = _mid_get_emit_side(sig=sig, ta=t, it=rec)
-        if side not in ("LONG", "SHORT"):
-            return ""
-
-        route_s = str(route or rec.get("smc_setup_route") or rec.get("emit_route") or getattr(sig, "emit_route", "") or "").lower()
-        # The stricter default is aimed at the exact weak routes from the report:
-        # Structure pending trigger / origin fast-path / zone-touch/direct smart emits.
-        route_needs_guard = any(k in route_s for k in (
-            "pending", "trigger", "origin", "zone", "touch", "bos", "retest", "structure", "smc"
-        ))
-        if (not route_needs_guard) and not _env_bool("MID_REQUIRE_TRIGGER_FOLLOWTHROUGH_ALL_ROUTES", False):
-            return ""
-
-        atr = _mid_num_from_sources(t.get("atr_abs"), t.get("atr30"), rec.get("atr_at_create"), default=0.0)
-        open5 = _mid_num_from_sources(t.get("last_open_5m"), default=0.0)
-        close5 = _mid_num_from_sources(t.get("last_close_5m"), t.get("close"), t.get("entry"), default=0.0)
-        close_pos = _mid_num_from_sources(t.get("close_pos_5m"), default=0.50)
-        signed_body = _mid_num_from_sources(t.get("last_body_signed_atr_5m"), default=0.0)
-        body = _mid_num_from_sources(body_atr, t.get("current_body_atr"), t.get("disp_body_atr"), default=0.0)
-        if body <= 0 and atr > 0 and open5 > 0 and close5 > 0:
-            body = abs(close5 - open5) / max(atr, 1e-12)
-        vol = _mid_num_from_sources(vol_x, t.get("rel_vol"), t.get("vol_x"), rec.get("rel_vol_at_create"), default=0.0)
-
-        min_body = _mid_num_from_sources(os.getenv("MID_TRIGGER_FOLLOWTHROUGH_MIN_BODY_ATR"), default=0.12)
-        min_vol = _mid_num_from_sources(os.getenv("MID_TRIGGER_FOLLOWTHROUGH_MIN_VOL_X"), default=0.0)
-        long_close_pos = _mid_num_from_sources(os.getenv("MID_TRIGGER_FOLLOWTHROUGH_LONG_CLOSE_POS"), default=0.58)
-        short_close_pos = _mid_num_from_sources(os.getenv("MID_TRIGGER_FOLLOWTHROUGH_SHORT_CLOSE_POS"), default=0.42)
-
-        # A strong breakout/retest candle can be accepted even if vol feed is missing.
-        bo = str(t.get("bo_rt") or t.get("breakout_retest") or rec.get("bo_rt") or rec.get("breakout_retest") or "").upper()
-        bos_ok = bool(t.get("bos_up_5m") if side == "LONG" else t.get("bos_down_5m"))
-        sweep_ok = bool(t.get("sweep_long") if side == "LONG" else t.get("sweep_short"))
-
-        if side == "LONG":
-            aligned = (close5 > open5) if (open5 > 0 and close5 > 0) else (signed_body > 0)
-            strong_dir = bool(signed_body >= min_body or (body >= min_body and aligned))
-            accepted = bool(close_pos >= long_close_pos and aligned and strong_dir)
-            structural_confirm = bool(("BO↑" in bo or "BO UP" in bo or bos_ok or sweep_ok) and aligned and body >= max(min_body * 0.75, 0.08))
-            if not (accepted or structural_confirm):
-                return f"followthrough_missing:side=LONG|body_atr={body:.2f}|signed={signed_body:.2f}|close_pos={close_pos:.2f}|vol={vol:.2f}"
-        else:
-            aligned = (close5 < open5) if (open5 > 0 and close5 > 0) else (signed_body < 0)
-            strong_dir = bool((-signed_body) >= min_body or (body >= min_body and aligned))
-            accepted = bool(close_pos <= short_close_pos and aligned and strong_dir)
-            structural_confirm = bool(("BO↓" in bo or "BO DOWN" in bo or bos_ok or sweep_ok) and aligned and body >= max(min_body * 0.75, 0.08))
-            if not (accepted or structural_confirm):
-                return f"followthrough_missing:side=SHORT|body_atr={body:.2f}|signed={signed_body:.2f}|close_pos={close_pos:.2f}|vol={vol:.2f}"
-
-        if min_vol > 0 and vol > 0 and vol < min_vol:
-            return f"followthrough_weak_volume:side={side}|vol={vol:.2f}<{min_vol:.2f}|body_atr={body:.2f}"
-        return ""
-    except Exception:
-        # Fail open on unexpected metadata problems; candle/TA absence is handled elsewhere.
-        return ""
-
-
-def _mid_late_impulse_entry_reason(*,
-                                   sig=None,
-                                   ta: dict | None = None,
-                                   it: dict | None = None,
-                                   route: str | None = None,
-                                   body_atr: float | None = None,
-                                   vol_x: float | None = None) -> str:
-    """Block entries immediately after a strong pump/dump unless there was pullback or acceptance.
-
-    Manual-review rule: avoid LONG after pump near high / SHORT after dump near low.
-    Allow the trade only if price pulled back enough into a better location OR the
-    trigger candle shows real acceptance/continuation.
-    """
-    try:
-        if not _env_bool("MID_BLOCK_LATE_IMPULSE_ENTRY", True):
-            return ""
-        t = ta if isinstance(ta, dict) else {}
-        rec = it if isinstance(it, dict) else {}
-        side = _mid_get_emit_side(sig=sig, ta=t, it=rec)
-        if side not in ("LONG", "SHORT"):
-            return ""
-
-        entry = _mid_num_from_sources(getattr(sig, "entry", None) if sig is not None else None, t.get("entry"), t.get("close"), default=0.0)
-        atr = _mid_num_from_sources(t.get("atr_abs"), t.get("atr30"), rec.get("atr_at_create"), default=0.0)
-        if entry <= 0 or atr <= 0:
-            return ""
-        recent_low = _mid_num_from_sources(t.get("recent_low"), t.get("local_low"), t.get("range_low"), default=0.0)
-        recent_high = _mid_num_from_sources(t.get("recent_high"), t.get("local_high"), t.get("range_high"), default=0.0)
-        rpos = _mid_num_from_sources(t.get("local_range_pos_val"), t.get("range_pos_val"), default=0.50)
-        body = _mid_num_from_sources(body_atr, t.get("current_body_atr"), t.get("disp_body_atr"), default=0.0)
-        signed_body = _mid_num_from_sources(t.get("last_body_signed_atr_5m"), default=0.0)
-        close_pos = _mid_num_from_sources(t.get("close_pos_5m"), default=0.50)
-        vol = _mid_num_from_sources(vol_x, t.get("rel_vol"), t.get("vol_x"), rec.get("rel_vol_at_create"), default=0.0)
-
-        min_move_atr = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_MIN_MOVE_ATR"), default=1.25)
-        max_pullback_atr = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_MAX_PULLBACK_ATR"), default=0.35)
-        long_rpos = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_LONG_RANGE_POS"), default=0.70)
-        short_rpos = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_SHORT_RANGE_POS"), default=0.30)
-        accept_body = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_ACCEPT_BODY_ATR"), default=0.20)
-        accept_vol = _mid_num_from_sources(os.getenv("MID_LATE_IMPULSE_ACCEPT_VOL_X"), default=0.80)
-        if vol <= 0:
-            # Missing volume should not create a false bypass.
-            vol = 0.0
-
-        bo = str(t.get("bo_rt") or t.get("breakout_retest") or rec.get("bo_rt") or rec.get("breakout_retest") or "").upper()
-        if side == "LONG":
-            if recent_low <= 0 or recent_high <= 0 or recent_high <= recent_low:
-                return ""
-            move_atr = _mid_num_from_sources(t.get("move_from_recent_low_atr"), default=(entry - recent_low) / max(atr, 1e-12))
-            pullback_atr = max(0.0, (recent_high - entry) / max(atr, 1e-12))
-            acceptance = bool(
-                signed_body >= accept_body
-                and close_pos >= 0.62
-                and (vol >= accept_vol or "BO↑" in bo or bool(t.get("bos_up_5m")))
-            )
-            if move_atr >= min_move_atr and rpos >= long_rpos and pullback_atr <= max_pullback_atr and not acceptance:
-                return f"late_impulse_no_pullback:side=LONG|move_atr={move_atr:.2f}|pullback_atr={pullback_atr:.2f}|range_pos={rpos:.2f}|body_atr={body:.2f}|vol={vol:.2f}"
-        else:
-            if recent_low <= 0 or recent_high <= 0 or recent_high <= recent_low:
-                return ""
-            move_atr = _mid_num_from_sources(t.get("move_from_recent_high_atr"), default=(recent_high - entry) / max(atr, 1e-12))
-            pullback_atr = max(0.0, (entry - recent_low) / max(atr, 1e-12))
-            acceptance = bool(
-                signed_body <= -accept_body
-                and close_pos <= 0.38
-                and (vol >= accept_vol or "BO↓" in bo or bool(t.get("bos_down_5m")))
-            )
-            if move_atr >= min_move_atr and rpos <= short_rpos and pullback_atr <= max_pullback_atr and not acceptance:
-                return f"late_impulse_no_pullback:side=SHORT|move_atr={move_atr:.2f}|pullback_atr={pullback_atr:.2f}|range_pos={rpos:.2f}|body_atr={body:.2f}|vol={vol:.2f}"
-        return ""
-    except Exception:
-        return ""
-
-
-
 
 def _mid_fast_continuation_setup_check(
     sig=None,
@@ -3877,10 +3694,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         return "blocked"
     if r.startswith("quality_path") or r.startswith("quality_guard") or r.startswith("tp1_blocked") or r.startswith("no_clean_path") or r.startswith("sl_inside_pullback"):
         return "quality_guard"
-    if r.startswith("late_impulse") or r.startswith("late_from_anchor"):
+    if r.startswith("late_from_anchor"):
         return "late_entry"
-    if r.startswith("followthrough_missing") or r.startswith("followthrough_weak_volume"):
-        return "structure_fail"
     if "directional_contradiction" in r:
         return "directional_contradiction"
     if r.startswith("macd_hist=") or "macd_hist" in r:
@@ -4049,33 +3864,6 @@ def _mid_final_emit_gate_reason(*,
     )
     if _path_quality_reason:
         return str(_path_quality_reason)
-
-    # v55: user-requested hard guards from manual chart review.
-    # 1) Avoid entering immediately after a strong pump/dump without pullback.
-    # 2) Require one direction-confirming 5m candle at trigger/emit time.
-    # These guards intentionally run BEFORE direct-SMC bypass, so origin fast-path
-    # and structure-pending cannot bypass weak/no-follow-through cases.
-    _late_impulse_reason = _mid_late_impulse_entry_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        route=route,
-        body_atr=body_atr,
-        vol_x=vol_x,
-    )
-    if _late_impulse_reason:
-        return str(_late_impulse_reason)
-
-    _follow_reason = _mid_trigger_followthrough_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        route=route,
-        body_atr=body_atr,
-        vol_x=vol_x,
-    )
-    if _follow_reason:
-        return str(_follow_reason)
 
     if smc_direct_route:
         return ""
