@@ -754,7 +754,7 @@ def _mid_adaptive_veto_reason(*, sig=None, ta: dict | None = None, it: dict | No
     if direction not in ('LONG', 'SHORT'):
         return ''
     try:
-        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and _env_bool('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', True):
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and _env_bool('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', False):
             return ''
     except Exception:
         pass
@@ -12105,6 +12105,381 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
 
 
 
+# ===================== PROFESSIONAL 11-SETUP QUALITY GATE =====================
+# Purpose:
+#   The old MID scanner could let many different patterns pass through one generic
+#   score.  This gate gives every setup family its own minimum quality checklist.
+#   Result: fewer signals, more WAIT, fewer low-quality SL hits.
+#
+# Runtime toggles:
+#   MID_PRO_SETUP_RULES_ENABLED=1
+#   MID_PRO_SETUP_RULES_ENFORCE_ON_SCAN=0   # keep pending setup collection alive
+#   MID_REQUIRE_TRIGGER_HARD=1              # no sweep/BO-RT/OB/FVG trigger => no signal
+
+MID_PRO_SETUP_RULES: dict[str, dict[str, object]] = {
+    # A+ institutional setups
+    "liquidity_sweep_mss_retest": {
+        "label": "Liquidity sweep + MSS/BOS + retest",
+        "min_score": 90, "min_rr": 1.60, "min_vol_x": 1.10,
+        "min_adx30": 18, "min_adx1h": 20,
+        "allowed_regimes": ("TRENDING", "EXPANSION", "RANGING"),
+        "required": ("htf_not_against", "sweep", "trigger", "confirm_candle", "tp1_path"),
+    },
+    "smc_ob_fvg_overlap": {
+        "label": "OB + FVG overlap retest",
+        "min_score": 91, "min_rr": 1.60, "min_vol_x": 1.05,
+        "min_adx30": 18, "min_adx1h": 20,
+        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
+        "required": ("htf_not_against", "retest", "confirm_candle", "vwap_side", "tp1_path"),
+    },
+    "htf_ob_ltf_fvg": {
+        "label": "HTF OB + LTF FVG retest",
+        "min_score": 90, "min_rr": 1.55, "min_vol_x": 1.05,
+        "min_adx30": 18, "min_adx1h": 21,
+        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
+        "required": ("htf_not_against", "retest", "confirm_candle", "tp1_path"),
+    },
+    "bos_retest_confirm": {
+        "label": "BOS -> retest -> confirmation",
+        "min_score": 89, "min_rr": 1.55, "min_vol_x": 1.10,
+        "min_adx30": 20, "min_adx1h": 22,
+        "allowed_regimes": ("TRENDING", "EXPANSION"),
+        "required": ("htf_align", "breakout_retest", "confirm_candle", "vwap_side", "tp1_path"),
+    },
+    "breakout_retest_volume": {
+        "label": "Breakout + retest + volume",
+        "min_score": 88, "min_rr": 1.50, "min_vol_x": 1.20,
+        "min_adx30": 22, "min_adx1h": 22,
+        "allowed_regimes": ("TRENDING", "EXPANSION"),
+        "required": ("htf_align", "breakout_retest", "confirm_candle", "volume", "tp1_path"),
+    },
+    "fvg_retest_trend": {
+        "label": "FVG retest with trend",
+        "min_score": 88, "min_rr": 1.50, "min_vol_x": 1.05,
+        "min_adx30": 18, "min_adx1h": 21,
+        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
+        "required": ("htf_not_against", "fvg", "confirm_candle", "tp1_path"),
+    },
+    "order_block_retest": {
+        "label": "Order block retest",
+        "min_score": 89, "min_rr": 1.55, "min_vol_x": 1.05,
+        "min_adx30": 18, "min_adx1h": 21,
+        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
+        "required": ("htf_not_against", "ob", "confirm_candle", "tp1_path"),
+    },
+
+    # B setups: allowed, but stricter
+    "vwap_reclaim": {
+        "label": "VWAP reclaim / hold",
+        "min_score": 91, "min_rr": 1.60, "min_vol_x": 1.25,
+        "min_adx30": 22, "min_adx1h": 22,
+        "allowed_regimes": ("TRENDING", "EXPANSION"),
+        "required": ("htf_align", "vwap_side", "confirm_candle", "volume", "tp1_path"),
+    },
+    "range_deviation_return": {
+        "label": "Range deviation return after liquidity sweep",
+        "min_score": 92, "min_rr": 1.50, "min_vol_x": 1.15,
+        "min_adx30": 0, "min_adx1h": 0,
+        "allowed_regimes": ("RANGING", "COMPRESSION"),
+        "required": ("sweep", "trigger", "confirm_candle", "tp1_path"),
+    },
+    "trend_pullback": {
+        "label": "Trend pullback to value",
+        "min_score": 92, "min_rr": 1.60, "min_vol_x": 1.15,
+        "min_adx30": 24, "min_adx1h": 24,
+        "allowed_regimes": ("TRENDING", "EXPANSION"),
+        "required": ("htf_align", "vwap_side", "confirm_candle", "no_late_entry", "tp1_path"),
+    },
+
+    # C setup: can work, but should be rare and very strict.
+    "fast_continuation": {
+        "label": "Fast continuation / STX-like signal",
+        "min_score": 94, "min_rr": 1.70, "min_vol_x": 1.45,
+        "min_adx30": 28, "min_adx1h": 26,
+        "allowed_regimes": ("TRENDING", "EXPANSION"),
+        "required": ("htf_align", "confirm_candle", "volume", "vwap_side", "no_late_entry", "tp1_path"),
+    },
+}
+
+
+def _mid_pro_is_enabled() -> bool:
+    try:
+        return _env_bool("MID_PRO_SETUP_RULES_ENABLED", True)
+    except Exception:
+        return True
+
+
+def _mid_pro_f(value, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        if math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return float(default)
+
+
+def _mid_pro_s(value) -> str:
+    try:
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def _mid_pro_same_dir_sweep(ta: dict) -> bool:
+    side = _mid_pro_s(ta.get("direction")).upper()
+    return bool((side == "LONG" and ta.get("sweep_long")) or (side == "SHORT" and ta.get("sweep_short")))
+
+
+def _mid_pro_vwap_side(ta: dict) -> bool:
+    side = _mid_pro_s(ta.get("direction")).upper()
+    entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
+    vwap = _mid_pro_f(ta.get("vwap_val"), 0.0)
+    if entry <= 0 or vwap <= 0:
+        return False
+    return bool((side == "LONG" and entry >= vwap) or (side == "SHORT" and entry <= vwap))
+
+
+def _mid_pro_confirm_candle(ta: dict) -> bool:
+    side = _mid_pro_s(ta.get("direction")).upper()
+    opn = _mid_pro_f(ta.get("open"), 0.0)
+    cls = _mid_pro_f(ta.get("close") or ta.get("entry"), 0.0)
+    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
+    body = abs(cls - opn)
+    try:
+        min_body = float(os.getenv("MID_PRO_CONFIRM_BODY_ATR_MIN", os.getenv("MID_CONFIRM_CANDLE_BODY_ATR_MIN", "0.15")) or 0.15)
+    except Exception:
+        min_body = 0.15
+    if atr > 0 and (body / atr) < min_body:
+        return False
+    if side == "LONG":
+        return bool(cls > opn)
+    if side == "SHORT":
+        return bool(cls < opn)
+    return False
+
+
+def _mid_pro_no_late_entry(ta: dict) -> bool:
+    side = _mid_pro_s(ta.get("direction")).upper()
+    entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
+    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
+    if entry <= 0 or atr <= 0:
+        return False
+    try:
+        max_atr = float(os.getenv("MID_PRO_LATE_ENTRY_ATR_MAX", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35")) or 1.35)
+    except Exception:
+        max_atr = 1.35
+    recent_low = _mid_pro_f(ta.get("recent_low"), 0.0)
+    recent_high = _mid_pro_f(ta.get("recent_high"), 0.0)
+    if side == "LONG" and recent_low > 0:
+        return bool(((entry - recent_low) / atr) <= max_atr)
+    if side == "SHORT" and recent_high > 0:
+        return bool(((recent_high - entry) / atr) <= max_atr)
+    return True
+
+
+def _mid_pro_tp1_path_clear(ta: dict) -> bool:
+    """Block when TP1 is immediately behind nearest support/resistance."""
+    side = _mid_pro_s(ta.get("direction")).upper()
+    entry = _mid_pro_f(ta.get("entry"), 0.0)
+    tp1 = _mid_pro_f(ta.get("tp1"), 0.0)
+    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
+    if entry <= 0 or tp1 <= 0:
+        return False
+    try:
+        buffer_atr = float(os.getenv("MID_PRO_TP1_LEVEL_BUFFER_ATR", "0.12") or 0.12)
+    except Exception:
+        buffer_atr = 0.12
+    buf = max(atr * buffer_atr, entry * 0.0005)
+    support = _mid_pro_f(ta.get("support"), 0.0)
+    resistance = _mid_pro_f(ta.get("resistance"), 0.0)
+    if side == "LONG" and resistance > entry:
+        return bool(resistance >= (tp1 + buf))
+    if side == "SHORT" and support > 0 and support < entry:
+        return bool(support <= (tp1 - buf))
+    return True
+
+
+def _mid_pro_breakout_retest(ta: dict) -> bool:
+    txt = (_mid_pro_s(ta.get("bo_rt")) + " " + _mid_pro_s(ta.get("breakout_retest"))).upper()
+    return bool(("BO" in txt or "BREAK" in txt) and ("RETEST" in txt or "RT" in txt))
+
+
+def _mid_pro_setup_key(ta: dict) -> str:
+    """Map the current TA payload to one of the 11 professional setup families."""
+    route = _mid_pro_s(ta.get("smc_setup_route") or ta.get("emit_route")).lower()
+    src = _mid_setup_source_normalize(ta.get("setup_source") or ta.get("smart_emit_source") or ta.get("setup_source_label"))
+
+    route_map = {
+        "smc_liquidity_reclaim": "liquidity_sweep_mss_retest",
+        "liquidity_reclaim_emit": "liquidity_sweep_mss_retest",
+        "smc_ob_fvg_overlap": "smc_ob_fvg_overlap",
+        "smc_htf_ob_ltf_fvg": "htf_ob_ltf_fvg",
+        "smc_bos_retest_confirm": "bos_retest_confirm",
+        "breakout_fastpath": "breakout_retest_volume",
+        "origin_fastpath": "fast_continuation",
+        "smc_displacement_origin": "fast_continuation",
+        "smc_dual_fvg_origin": "fast_continuation",
+    }
+    if route in route_map:
+        return route_map[route]
+    if src == "fast_continuation":
+        return "fast_continuation"
+    if src == "liquidity_reclaim":
+        return "liquidity_sweep_mss_retest"
+    if src == "breakout":
+        return "breakout_retest_volume"
+    if src == "zone_retest" and ta.get("ob_retest") and ta.get("fvg_active"):
+        return "smc_ob_fvg_overlap"
+    if src == "zone_retest" and ta.get("ob_retest"):
+        return "order_block_retest"
+    if src == "zone_retest" and ta.get("fvg_active"):
+        return "fvg_retest_trend"
+
+    sweep = _mid_pro_same_dir_sweep(ta)
+    bo_rt = _mid_pro_breakout_retest(ta)
+    ob = bool(ta.get("ob_retest"))
+    fvg = bool(ta.get("fvg_active"))
+    regime = _mid_pro_s(ta.get("regime")).upper()
+    mstruct = _mid_pro_s(ta.get("mstruct")).upper()
+
+    if sweep and (bo_rt or ob or fvg):
+        return "liquidity_sweep_mss_retest"
+    if ob and fvg:
+        return "smc_ob_fvg_overlap"
+    if bo_rt and (ob or fvg):
+        return "bos_retest_confirm"
+    if bo_rt:
+        return "breakout_retest_volume"
+    if fvg:
+        return "fvg_retest_trend"
+    if ob:
+        return "order_block_retest"
+    if regime == "RANGING" and sweep:
+        return "range_deviation_return"
+    if _mid_pro_vwap_side(ta) and mstruct == "TREND":
+        return "trend_pullback"
+    if _mid_pro_vwap_side(ta):
+        return "vwap_reclaim"
+    return "fast_continuation"
+
+
+def _mid_pro_check_required(name: str, ta: dict) -> tuple[bool, str]:
+    side = _mid_pro_s(ta.get("direction")).upper()
+    dir1 = _mid_pro_s(ta.get("dir1")).upper()
+    dir4 = _mid_pro_s(ta.get("dir4") or ta.get("direction")).upper()
+    if name == "htf_align":
+        return (bool(dir1 and dir4 and dir1 == dir4 == side), "htf_align")
+    if name == "htf_not_against":
+        return (bool((not dir4) or dir4 == side), "htf_not_against")
+    if name == "sweep":
+        return (_mid_pro_same_dir_sweep(ta), "liquidity_sweep")
+    if name == "trigger":
+        ok = bool(_mid_pro_same_dir_sweep(ta) or _mid_pro_breakout_retest(ta) or ta.get("ob_retest") or ta.get("fvg_active"))
+        return (ok, "execution_trigger")
+    if name == "breakout_retest":
+        return (_mid_pro_breakout_retest(ta), "breakout_retest")
+    if name == "retest":
+        return (bool(_mid_pro_breakout_retest(ta) or ta.get("ob_retest") or ta.get("fvg_active")), "retest")
+    if name == "ob":
+        return (bool(ta.get("ob_retest")), "order_block_retest")
+    if name == "fvg":
+        return (bool(ta.get("fvg_active")), "fvg_retest")
+    if name == "confirm_candle":
+        return (_mid_pro_confirm_candle(ta), "confirm_candle")
+    if name == "volume":
+        try:
+            min_v = float(os.getenv("MID_PRO_MIN_VOL_X", "1.15") or 1.15)
+        except Exception:
+            min_v = 1.15
+        return (_mid_pro_f(ta.get("rel_vol"), 0.0) >= min_v, "volume")
+    if name == "vwap_side":
+        return (_mid_pro_vwap_side(ta), "vwap_side")
+    if name == "no_late_entry":
+        return (_mid_pro_no_late_entry(ta), "no_late_entry")
+    if name == "tp1_path":
+        return (_mid_pro_tp1_path_clear(ta), "tp1_path_clear")
+    return (True, name)
+
+
+def _mid_professional_setup_gate(ta: dict, *, market: str = "FUTURES", symbol: str = "") -> tuple[bool, str, dict]:
+    """Return (allowed, reason, meta).  Designed to be called after SL/TP are built."""
+    meta: dict[str, object] = {}
+    if not _mid_pro_is_enabled():
+        return True, "disabled", meta
+    if not isinstance(ta, dict) or not ta:
+        return False, "professional_gate:no_ta", meta
+
+    setup_key = _mid_pro_setup_key(ta)
+    rule = dict(MID_PRO_SETUP_RULES.get(setup_key) or MID_PRO_SETUP_RULES["fast_continuation"])
+    meta["setup_key"] = setup_key
+    meta["setup_label"] = str(rule.get("label") or setup_key)
+
+    try:
+        _phase = str(_MID_EVAL_PHASE.get() or "scan").lower()
+    except Exception:
+        _phase = "scan"
+    try:
+        pending_enabled = _env_bool("MID_PENDING_ENABLED", False)
+        postsetup_only = _env_bool("MID_FILTERS_AFTER_SETUP", True)
+        enforce_on_scan = _env_bool("MID_PRO_SETUP_RULES_ENFORCE_ON_SCAN", False)
+    except Exception:
+        pending_enabled, postsetup_only, enforce_on_scan = False, True, False
+    if _phase == "scan" and pending_enabled and postsetup_only and not enforce_on_scan:
+        meta["deferred"] = True
+        return True, "deferred_to_trigger", meta
+
+    score = _mid_pro_f(ta.get("confidence") or ta.get("ta_score_conf") or ta.get("ta_score"), 0.0)
+    rr = _mid_pro_f(ta.get("rr"), 0.0)
+    vol = _mid_pro_f(ta.get("rel_vol"), 0.0)
+    adx30 = _mid_pro_f(ta.get("adx1"), 0.0)
+    adx1h = _mid_pro_f(ta.get("adx4"), 0.0)
+    regime = _mid_pro_s(ta.get("regime")).upper() or "—"
+
+    # Optional global overrides keep tuning simple from Railway/.env.
+    min_score = max(_mid_pro_f(rule.get("min_score"), 90.0), _mid_pro_f(os.getenv("MID_PRO_MIN_SCORE", 0.0), 0.0))
+    min_rr = max(_mid_pro_f(rule.get("min_rr"), 1.5), _mid_pro_f(os.getenv("MID_PRO_MIN_RR", 0.0), 0.0))
+    min_vol = max(_mid_pro_f(rule.get("min_vol_x"), 1.0), _mid_pro_f(os.getenv("MID_PRO_MIN_VOL_X", 0.0), 0.0))
+    min_adx30 = max(_mid_pro_f(rule.get("min_adx30"), 0.0), _mid_pro_f(os.getenv("MID_PRO_MIN_ADX_30M", 0.0), 0.0))
+    min_adx1h = max(_mid_pro_f(rule.get("min_adx1h"), 0.0), _mid_pro_f(os.getenv("MID_PRO_MIN_ADX_1H", 0.0), 0.0))
+
+    checks = {
+        "score": score, "rr": rr, "vol_x": vol, "adx30": adx30, "adx1h": adx1h, "regime": regime,
+    }
+    meta["checks"] = checks
+
+    allowed_regimes = tuple(str(x).upper() for x in (rule.get("allowed_regimes") or ()))
+    if allowed_regimes and regime not in allowed_regimes:
+        return False, f"professional_gate:{setup_key}:regime={regime}:allowed={','.join(allowed_regimes)}", meta
+    if score < min_score:
+        return False, f"professional_gate:{setup_key}:score={score:.0f}<min={min_score:.0f}", meta
+    if rr < min_rr:
+        return False, f"professional_gate:{setup_key}:rr={rr:.2f}<min={min_rr:.2f}", meta
+    if vol < min_vol:
+        return False, f"professional_gate:{setup_key}:vol_x={vol:.2f}<min={min_vol:.2f}", meta
+    if adx30 < min_adx30:
+        return False, f"professional_gate:{setup_key}:adx30={adx30:.1f}<min={min_adx30:.1f}", meta
+    if adx1h < min_adx1h:
+        return False, f"professional_gate:{setup_key}:adx1h={adx1h:.1f}<min={min_adx1h:.1f}", meta
+
+    for req in tuple(rule.get("required") or ()):  # route-specific checklist
+        ok, label = _mid_pro_check_required(str(req), ta)
+        if not ok:
+            return False, f"professional_gate:{setup_key}:missing_{label}", meta
+
+    # Explicit no-trigger risk flag is never allowed on final signal in professional mode.
+    try:
+        flags = [str(x).lower() for x in (ta.get("risk_flags") or [])]
+        if "no_trigger" in flags and _env_bool("MID_REQUIRE_TRIGGER_HARD", True):
+            return False, f"professional_gate:{setup_key}:risk_no_trigger", meta
+    except Exception:
+        pass
+
+    return True, "ok", meta
+
+# =================== END PROFESSIONAL 11-SETUP QUALITY GATE ===================
+
+
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
     base = _mid_setup_source_label(setup_source)
     # FAST CONTINUATION is a user-facing setup profile, not a route suffix. Keep
@@ -18077,7 +18452,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     if (not np.isnan(lo5)) and (not np.isnan(hi5)):
                         ob_retest = (hi5 >= zlo - tol) and (lo5 <= zhi + tol)
                 except Exception:
-                    ob_retest = False        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB retests.
+                    ob_retest = False        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB/FVG retests.
         if use_regime and mid_regime == "RANGING":
             if bo_rt_trigger and (not (sweep_long or sweep_short) and (not ob_retest)):
                 # prevent range fake breakouts
@@ -18092,15 +18467,24 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     base_r.setdefault("risk_flags", [])
                     base_r["risk_flags"].append("regime_range_no_breakout")
                 except Exception:
-                    pass        # Require-trigger now works as a score component, not as a hard setup gate.
-        # If there is no execution trigger yet, we keep only a soft risk flag and let
-        # the score layer apply a small penalty instead of killing the setup.
+                    pass
+
+        # PROFESSIONAL MODE:
+        # No real execution trigger = no final signal. During SCAN we may still keep a pending
+        # setup when MID_PENDING_ENABLED=1 and MID_FILTERS_AFTER_SETUP=1, but on TRIGGER/EMIT
+        # the bot must have sweep / breakout-retest / OB retest / FVG retest confirmation.
         if require_trigger:
-            trig_ok = False
             if str(dir_trend).upper() == "LONG":
                 trig_ok = bool(sweep_long) or bool(bo_rt_trigger) or bool(ob_retest)
             else:
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
+
+            try:
+                # FVG retest is also a valid professional trigger, but only if it is active now.
+                trig_ok = bool(trig_ok or fvg_active)
+            except Exception:
+                pass
+
             if not trig_ok:
                 try:
                     base_r.setdefault("risk_flags", [])
@@ -18108,6 +18492,17 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                         base_r["risk_flags"].append("no_trigger")
                 except Exception:
                     pass
+
+                try:
+                    _phase = str(_MID_EVAL_PHASE.get() or "scan").lower()
+                except Exception:
+                    _phase = "scan"
+
+                hard_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER_HARD", "1")
+                defer_scan = bool(pending_enabled and postsetup_only and _phase == "scan")
+                if hard_trigger and not defer_scan:
+                    _fail("structure", "no_execution_trigger")
+                    return None
     except Exception:
         # Never block if engine fails unexpectedly.
         pass
@@ -19007,6 +19402,22 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             ta["level_engine"] = "STRUCTURE_FIRST"
     except Exception:
         pass
+    # Professional 11-setup gate: final quality checklist after SL/TP are finalized.
+    try:
+        _pro_ok, _pro_reason, _pro_meta = _mid_professional_setup_gate(ta, market=str(market or "FUTURES"), symbol=str(symbol or ""))
+        ta["professional_setup_key"] = str((_pro_meta or {}).get("setup_key") or "")
+        ta["professional_setup_label"] = str((_pro_meta or {}).get("setup_label") or "")
+        ta["professional_gate_reason"] = str(_pro_reason or "")
+        if not _pro_ok:
+            _fail("quality_guard", str(_pro_reason or "professional_gate"))
+            return None
+    except Exception as _pro_exc:
+        # Fail-open only if the gate itself crashes; use logs for debugging.
+        try:
+            logger.warning("[mid][professional-gate] %s failed: %s", symbol, _pro_exc)
+        except Exception:
+            pass
+
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
