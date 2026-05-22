@@ -2634,6 +2634,35 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
     }
 
 
+async def get_last_closed_signals(*, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return latest closed signals for rolling diagnostics."""
+    lim = max(1, min(500, int(limit or 50)))
+    try:
+        pool = get_pool()
+    except Exception:
+        return []
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, symbol, market, side, entry, tp1, tp2, sl,
+                       opened_at, closed_at, status, pnl_total_pct,
+                       setup_source, emit_route, timeframe, confidence, rr,
+                       entry_snapshot_json, close_analysis_json, weak_filters, improve_note, risk_note
+                FROM signal_tracks
+                WHERE closed_at IS NOT NULL
+                  AND status IN ('WIN','LOSS','BE','EXPIRED','UNCERTAIN','CLOSED')
+                ORDER BY closed_at DESC NULLS LAST, signal_id DESC
+                LIMIT $1;
+                """,
+                lim,
+            )
+            return [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception("get_last_closed_signals failed")
+            return []
+
+
 
 def _signal_loss_diag_empty() -> Dict[str, Any]:
     return {

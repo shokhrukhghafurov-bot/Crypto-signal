@@ -11655,6 +11655,72 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.pop()
     return "\n".join(lines)
 
+
+def _last50_bucket_add(bucket: dict, row: dict) -> None:
+    st = str(row.get("status") or "").upper().strip()
+    bucket["total"] = int(bucket.get("total") or 0) + 1
+    bucket[st] = int(bucket.get(st) or 0) + 1
+    try:
+        bucket["pnl_sum"] = float(bucket.get("pnl_sum") or 0.0) + float(row.get("pnl_total_pct") or 0.0)
+    except Exception:
+        pass
+
+
+async def _analyze_last_closed_signals(*, limit: int = 50) -> dict:
+    rows = await db_store.get_last_closed_signals(limit=limit)
+    out = {"found": len(rows), "rows": rows, "overall": {"total": 0, "pnl_sum": 0.0}, "by_setup": {}, "by_side": {}, "by_symbol": {}, "by_route": {}, "mismatch": 0, "top_loss_reasons": {}, "top_weak_filters": {}}
+    for row in rows:
+        _last50_bucket_add(out["overall"], row)
+        setup = str(_daily_report_setup_key_from_row(row) or "unknown")
+        side = str(row.get("side") or "").upper().strip() or "UNKNOWN"
+        symbol = str(row.get("symbol") or "").upper().strip() or "UNKNOWN"
+        route = str(row.get("emit_route") or "").strip() or "unknown"
+        _last50_bucket_add(out["by_setup"].setdefault(setup, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_side"].setdefault(side, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_symbol"].setdefault(symbol, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_route"].setdefault(route, {"total": 0, "pnl_sum": 0.0}), row)
+        for reason in _daily_report_reason_codes(row):
+            out["top_loss_reasons"][reason] = int(out["top_loss_reasons"].get(reason) or 0) + 1
+        for item in _daily_report_split_multi(row.get("weak_filters")):
+            out["top_weak_filters"][item] = int(out["top_weak_filters"].get(item) or 0) + 1
+
+        # Candle-based recheck (best-effort, production-ready on Railway)
+        try:
+            side_u = str(row.get("side") or "").upper().strip()
+            tp = _daily_report_float(row.get("tp2")) or _daily_report_float(row.get("tp1"))
+            sl = _daily_report_float(row.get("sl"))
+            if tp > 0 and sl > 0 and side_u in ("LONG", "SHORT"):
+                sym = str(row.get("symbol") or "")
+                mkt = str(row.get("market") or "FUTURES")
+                tf = str(row.get("timeframe") or "5m")
+                df = await backend.load_candles(sym, tf, market=mkt, limit=400)
+                verdict = ""
+                if df is not None and not getattr(df, "empty", True):
+                    for _, c in df.tail(300).iterrows():
+                        hi = float(c.get("high") or 0.0)
+                        lo = float(c.get("low") or 0.0)
+                        if side_u == "LONG":
+                            hit_tp = hi >= tp
+                            hit_sl = lo <= sl
+                        else:
+                            hit_tp = lo <= tp
+                            hit_sl = hi >= sl
+                        if hit_tp and hit_sl:
+                            verdict = "UNCERTAIN"
+                            break
+                        if hit_tp:
+                            verdict = "WIN"
+                            break
+                        if hit_sl:
+                            verdict = "LOSS"
+                            break
+                st_db = str(row.get("status") or "").upper().strip()
+                if verdict and st_db in ("WIN", "LOSS") and verdict != st_db:
+                    out["mismatch"] = int(out.get("mismatch") or 0) + 1
+        except Exception:
+            pass
+    return out
+
 async def _report_bot_send_long(chat_id: int, text: str) -> None:
     if _report_bot is None:
         return
@@ -12470,6 +12536,53 @@ async def cmd_autotrade_stress(message: types.Message):
         for e in errs[:5]:
             txt.append(f"- `{e}`")
     await message.answer("\n".join(txt), parse_mode="Markdown")
+
+
+@dp.message(Command("analyze_last50"))
+async def cmd_analyze_last50(message: types.Message):
+    uid = int(message.from_user.id) if message and message.from_user else 0
+    if not is_admin(uid):
+        return
+    await message.answer("⏳ Running rolling-50 closed signals analysis...")
+    rep = await _analyze_last_closed_signals(limit=50)
+    overall = dict(rep.get("overall") or {})
+    win = int(overall.get("WIN") or 0); loss = int(overall.get("LOSS") or 0)
+    be = int(overall.get("BE") or 0); expired = int(overall.get("EXPIRED") or 0); uncertain = int(overall.get("UNCERTAIN") or 0)
+    total = int(overall.get("total") or 0)
+    wr = (100.0 * win / max(1, win + loss)) if (win + loss) > 0 else 0.0
+    avg_pnl = (float(overall.get("pnl_sum") or 0.0) / max(1, total)) if total > 0 else 0.0
+
+    def _top(src: dict, *, best: bool, n: int = 5) -> list[tuple[str, int, float]]:
+        arr = []
+        for k, v in (src or {}).items():
+            t = int(v.get("total") or 0); w = int(v.get("WIN") or 0); l = int(v.get("LOSS") or 0)
+            r = (100.0 * w / max(1, w + l)) if (w + l) > 0 else 0.0
+            arr.append((str(k), t, r))
+        arr = [x for x in arr if x[1] > 0]
+        arr.sort(key=lambda x: (x[2], x[1]), reverse=best)
+        return arr[:n]
+
+    best_setup = _top(rep.get("by_setup") or {}, best=True)
+    worst_setup = _top(rep.get("by_setup") or {}, best=False)
+    top_reasons = sorted(list((rep.get("top_loss_reasons") or {}).items()), key=lambda kv: kv[1], reverse=True)[:5]
+    top_weak = sorted(list((rep.get("top_weak_filters") or {}).items()), key=lambda kv: kv[1], reverse=True)[:5]
+    lines = [
+        f"📊 Closed analyzed: {int(rep.get('found') or 0)}",
+        f"WIN/LOSS/BE/EXPIRED/UNCERTAIN: {win}/{loss}/{be}/{expired}/{uncertain}",
+        f"Winrate(resolved): {wr:.1f}%",
+        f"Avg PnL: {avg_pnl:+.2f}%",
+        f"Candle↔DB mismatch count: {int(rep.get('mismatch') or 0)}",
+        "",
+        "🏆 Best setups:",
+    ]
+    lines += [f"• {k}: wr={r:.1f}% n={t}" for k, t, r in best_setup] or ["• —"]
+    lines += ["", "⚠️ Worst setups:"]
+    lines += [f"• {k}: wr={r:.1f}% n={t}" for k, t, r in worst_setup] or ["• —"]
+    lines += ["", "❌ Top LOSS reasons:"]
+    lines += [f"• {k}: {v}" for k, v in top_reasons] or ["• —"]
+    lines += ["", "🧪 Top weak filters passed:"]
+    lines += [f"• {k}: {v}" for k, v in top_weak] or ["• —"]
+    await _report_bot_send_long(uid, "\n".join(lines))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
 async def lang_choose(call: types.CallbackQuery) -> None:
