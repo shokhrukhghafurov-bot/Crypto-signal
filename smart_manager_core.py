@@ -177,6 +177,87 @@ class TP2RunnerDecision:
     back_to_tp2: bool
 
 
+def evaluate_setup_quality_gate(*,
+                                setup_name: str,
+                                side: str,
+                                confidence: float,
+                                ta_score: float,
+                                rr: float,
+                                adx: float,
+                                rsi: float,
+                                vol_x: float,
+                                atr_pct: float,
+                                macd_hist: float,
+                                trend: str,
+                                regime: str,
+                                price_vs_vwap: float,
+                                bb_pos: str,
+                                setup_rules: dict | None = None) -> tuple[bool, list[str], dict]:
+    rules = dict(setup_rules or {})
+    blocked: list[str] = []
+    need = {
+        "min_confidence": float(rules.get("min_confidence", 70.0)),
+        "min_ta_score": float(rules.get("min_ta_score", 65.0)),
+        "min_rr": float(rules.get("min_rr", 1.4)),
+        "min_adx": float(rules.get("min_adx", 18.0)),
+        "min_volume": float(rules.get("min_volume", 1.0)),
+        "min_atr_pct": float(rules.get("min_atr_pct", 0.12)),
+        "max_atr_pct": float(rules.get("max_atr_pct", 6.5)),
+    }
+    rsi_min, rsi_max = rules.get("rsi_range", (30.0, 70.0))
+    side_u = str(side or "").upper()
+    trend_u = str(trend or "").upper()
+    regime_u = str(regime or "").upper()
+    allowed_regimes = {str(x).upper() for x in (rules.get("allowed_regimes") or []) if str(x).strip()}
+    if confidence < need["min_confidence"]:
+        blocked.append("CONFIDENCE_TOO_LOW")
+    if ta_score < need["min_ta_score"]:
+        blocked.append("TA_SCORE_TOO_LOW")
+    if rr < need["min_rr"]:
+        blocked.append("RR_TOO_LOW")
+    if adx < need["min_adx"]:
+        blocked.append("ADX_TOO_LOW")
+    if vol_x < need["min_volume"]:
+        blocked.append("VOLUME_TOO_LOW")
+    if not (float(rsi_min) <= rsi <= float(rsi_max)):
+        blocked.append("RSI_BAD_ZONE")
+    if atr_pct < need["min_atr_pct"]:
+        blocked.append("ATR_TOO_LOW")
+    if atr_pct > need["max_atr_pct"]:
+        blocked.append("ATR_TOO_HIGH")
+    if side_u == "LONG" and trend_u in ("DOWN", "BEAR", "BEARISH"):
+        blocked.append("TREND_NOT_ALIGNED")
+    if side_u == "SHORT" and trend_u in ("UP", "BULL", "BULLISH"):
+        blocked.append("TREND_NOT_ALIGNED")
+    if abs(float(price_vs_vwap or 0.0)) > float(rules.get("max_vwap_dev_atr", 2.2)):
+        blocked.append("VWAP_NOT_CONFIRMED")
+    if side_u == "LONG" and float(macd_hist) < float(rules.get("min_macd_hist_long", -0.02)):
+        blocked.append("MACD_WEAK")
+    if side_u == "SHORT" and float(macd_hist) > float(rules.get("max_macd_hist_short", 0.02)):
+        blocked.append("MACD_WEAK")
+    if str(bb_pos or "").lower() in {"upper_break", "lower_break"}:
+        blocked.append("BB_BAD_POSITION")
+    if allowed_regimes and regime_u not in allowed_regimes:
+        blocked.append("MARKET_NOT_SUITABLE")
+    actual = {
+        "setup_name": str(setup_name or ""),
+        "side": side_u,
+        "confidence": float(confidence or 0.0),
+        "ta_score": float(ta_score or 0.0),
+        "rr": float(rr or 0.0),
+        "adx": float(adx or 0.0),
+        "rsi": float(rsi or 0.0),
+        "vol_x": float(vol_x or 0.0),
+        "atr_pct": float(atr_pct or 0.0),
+        "macd_hist": float(macd_hist or 0.0),
+        "trend": trend_u,
+        "regime": regime_u,
+        "price_vs_vwap": float(price_vs_vwap or 0.0),
+        "bb_pos": str(bb_pos or ""),
+    }
+    return (len(blocked) == 0, blocked, {"required": need, "actual": actual, "rsi_range": [float(rsi_min), float(rsi_max)]})
+
+
 class SmartDecisionEngine:
     @staticmethod
     def compute_tp2_probability(*, entry_price: float, current_price: float, best_price: float, last_price: float, tp2_price: float, direction: str) -> TP1Decision:
