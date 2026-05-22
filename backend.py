@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-21_v2_professional_early_impulse"
+MID_BUILD_TAG = "MID_BUILD_2026-05-22_v3_loss_guard_professional"
 
 import asyncio
 import json
@@ -3709,6 +3709,219 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
+
+
+def _mid_loss_guard_v3_reason(*,
+                              sig=None,
+                              ta: dict | None = None,
+                              it: dict | None = None,
+                              gate_meta: dict | None = None,
+                              route: str | None = None,
+                              vol_x: float | None = None,
+                              body_atr: float | None = None,
+                              macd_hist: float | None = None) -> str:
+    """Final loss-reduction guard before emit.
+
+    Purpose: block the common 50/50 failure pattern where a formal setup exists,
+    but the real entry has weak directional confluence: HTF is mixed/against,
+    VWAP side is wrong, candle/volume are weak, RR is poor, or the entry is late.
+
+    This guard does not promise profit. It intentionally reduces signal count and
+    keeps only entries with stronger multi-factor agreement.
+    """
+    try:
+        if not _env_bool("MID_LOSS_GUARD_V3_ENABLED", True):
+            return ""
+    except Exception:
+        return ""
+    try:
+        t = ta if isinstance(ta, dict) else {}
+        r = it if isinstance(it, dict) else {}
+        g = gate_meta if isinstance(gate_meta, dict) else {}
+
+        def _f(*vals, default=None):
+            for v in vals:
+                try:
+                    if v is None or v == "":
+                        continue
+                    fv = float(v)
+                    if math.isfinite(fv):
+                        return fv
+                except Exception:
+                    pass
+            return default
+
+        def _s(*vals):
+            for v in vals:
+                try:
+                    if v is None:
+                        continue
+                    txt = str(v).strip()
+                    if txt:
+                        return txt
+                except Exception:
+                    pass
+            return ""
+
+        def _tok(value) -> str:
+            try:
+                x = str(value or "").strip().upper()
+            except Exception:
+                x = ""
+            if not x:
+                return ""
+            if any(k in x for k in ("LONG", "UP", "BULL", "HH", "HL", "BUY")):
+                return "LONG"
+            if any(k in x for k in ("SHORT", "DOWN", "BEAR", "LH", "LL", "SELL")):
+                return "SHORT"
+            return ""
+
+        def _envf(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        direction = _s(getattr(sig, "direction", None) if sig is not None else None,
+                       t.get("direction"), r.get("direction"), g.get("direction")).upper()
+        if direction not in ("LONG", "SHORT"):
+            return ""
+        market = _s(getattr(sig, "market", None) if sig is not None else None,
+                    t.get("market"), r.get("market"), g.get("market"), "FUTURES").upper()
+        setup_key = _s(route,
+                       getattr(sig, "emit_route", None) if sig is not None else None,
+                       getattr(sig, "smc_setup_route", None) if sig is not None else None,
+                       getattr(sig, "setup_source", None) if sig is not None else None,
+                       t.get("emit_route"), t.get("smc_setup_route"), t.get("setup_source"),
+                       r.get("emit_route"), r.get("smc_setup_route"), r.get("setup_source"),
+                       g.get("emit_route"), g.get("setup_key"), g.get("setup_source"))
+        setup_l = setup_key.lower()
+        is_early_like = any(x in setup_l for x in (
+            "fast_continuation", "vwap_reclaim", "trend_pullback", "breakout_retest_volume", "early", "impulse"
+        ))
+        is_range_like = any(x in setup_l for x in ("range_deviation", "range", "compression"))
+
+        # 1) Levels must be direction-consistent and worth the risk.
+        level_reason = _mid_level_quality_veto_reason(sig=sig, ta=t, it=r)
+        if level_reason:
+            return f"loss_guard_v3_levels:{level_reason}"
+
+        entry = _f(getattr(sig, "entry", None) if sig is not None else None, t.get("entry"), t.get("close"), r.get("entry"), default=0.0)
+        sl = _f(getattr(sig, "sl", None) if sig is not None else None, r.get("sl"), t.get("sl"), default=0.0)
+        tp1 = _f(getattr(sig, "tp1", None) if sig is not None else None, r.get("tp1"), t.get("tp1"), t.get("tp"), default=0.0)
+        tp2 = _f(getattr(sig, "tp2", None) if sig is not None else None, r.get("tp2"), t.get("tp2"), default=0.0)
+        if entry <= 0 or sl <= 0 or (tp1 <= 0 and tp2 <= 0):
+            return "loss_guard_v3_bad_levels"
+        target = tp2 if tp2 > 0 else tp1
+        risk = abs(entry - sl)
+        rr = abs(target - entry) / max(risk, 1e-12)
+        rr1 = abs(tp1 - entry) / max(risk, 1e-12) if tp1 > 0 else rr
+        min_rr = _envf("MID_LOSS_GUARD_V3_MIN_RR_FUTURES" if market == "FUTURES" else "MID_LOSS_GUARD_V3_MIN_RR_SPOT", 1.55 if market == "FUTURES" else 1.45)
+        min_tp1_rr = _envf("MID_LOSS_GUARD_V3_MIN_TP1_RR", 1.05)
+        if rr + 1e-12 < min_rr:
+            return f"loss_guard_v3_rr:{rr:.2f}<{min_rr:.2f}"
+        if rr1 + 1e-12 < min_tp1_rr:
+            return f"loss_guard_v3_tp1_rr:{rr1:.2f}<{min_tp1_rr:.2f}"
+
+        # 2) Context values.
+        atr = _f(t.get("atr30"), t.get("atr_abs"), r.get("atr_at_create"), g.get("atr_abs"), default=0.0)
+        vx = _f(vol_x, t.get("rel_vol"), t.get("vol_x"), r.get("rel_vol"), r.get("vol_x"), g.get("vol_x"), default=0.0)
+        b_atr = _f(body_atr, t.get("body_atr"), g.get("current_body_atr"), g.get("origin_body_atr"), default=None)
+        if b_atr is None:
+            last_body = _f(t.get("last_body"), default=None)
+            b_atr = _mid_body_atr(last_body, atr) if last_body is not None else 0.0
+        adx30 = _f(t.get("adx_30m"), t.get("adx1"), r.get("adx_30m"), r.get("adx1"), g.get("adx_30m"), default=None)
+        adx1h = _f(t.get("adx_1h"), t.get("adx4"), r.get("adx_1h"), r.get("adx4"), g.get("adx_1h"), default=None)
+        adx_vals = [x for x in (adx30, adx1h) if x is not None]
+        adx_mix = sum(adx_vals) / len(adx_vals) if adx_vals else None
+        close = _f(t.get("close"), t.get("price"), t.get("entry"), entry, default=entry)
+        open_v = _f(t.get("open"), t.get("last_open"), default=None)
+        vwap = _f(t.get("vwap"), t.get("vwap_30m"), t.get("vwap1"), r.get("vwap"), g.get("vwap"), default=None)
+        macd_v = _f(macd_hist, t.get("macd_hist"), r.get("macd_hist"), g.get("macd_hist"), default=None)
+
+        # 3) Hard directional filters.
+        htf_tokens = [
+            _tok(_s(t.get("dir4"), t.get("trend_1h"), t.get("direction_1h"), r.get("dir4"), g.get("dir4"))),
+            _tok(_s(t.get("dir1"), t.get("trend_30m"), t.get("direction_30m"), r.get("dir1"), g.get("dir1"))),
+            _tok(_s(t.get("direction_4h"), t.get("trend_4h"), r.get("direction_4h"), g.get("direction_4h"))),
+        ]
+        htf_tokens = [x for x in htf_tokens if x]
+        against = sum(1 for x in htf_tokens if x and x != direction)
+        align = sum(1 for x in htf_tokens if x == direction)
+        if against >= int(_envf("MID_LOSS_GUARD_V3_MAX_HTF_AGAINST", 1)):
+            return f"loss_guard_v3_htf_against:{against}"
+        if is_early_like and align < int(_envf("MID_LOSS_GUARD_V3_EARLY_MIN_HTF_ALIGN", 1)):
+            return f"loss_guard_v3_htf_not_aligned:{align}"
+
+        vwap_ok = True
+        if vwap is not None and vwap > 0:
+            vwap_ok = close >= float(vwap) if direction == "LONG" else close <= float(vwap)
+            if not vwap_ok:
+                return "loss_guard_v3_wrong_vwap_side"
+
+        candle_dir_ok = True
+        if open_v is not None:
+            candle_dir_ok = close > open_v if direction == "LONG" else close < open_v
+            if not candle_dir_ok:
+                return "loss_guard_v3_wrong_candle"
+
+        # 4) Minimum momentum / quality. Early impulse must be stronger.
+        min_vol = _envf("MID_LOSS_GUARD_V3_EARLY_MIN_VOL_X" if is_early_like else "MID_LOSS_GUARD_V3_MIN_VOL_X", 1.35 if is_early_like else 1.18)
+        if "fast_continuation" in setup_l:
+            min_vol = max(min_vol, _envf("MID_LOSS_GUARD_V3_FAST_MIN_VOL_X", 1.45))
+        if vx > 0 and vx + 1e-12 < min_vol:
+            return f"loss_guard_v3_volume:{vx:.2f}<{min_vol:.2f}"
+
+        min_body = _envf("MID_LOSS_GUARD_V3_EARLY_MIN_BODY_ATR" if is_early_like else "MID_LOSS_GUARD_V3_MIN_BODY_ATR", 0.18 if is_early_like else 0.12)
+        if b_atr > 0 and b_atr + 1e-12 < min_body:
+            return f"loss_guard_v3_body:{b_atr:.2f}<{min_body:.2f}"
+
+        if not is_range_like:
+            min_adx = _envf("MID_LOSS_GUARD_V3_MIN_ADX_MIX", 22.0)
+            if adx_mix is not None and adx_mix + 1e-12 < min_adx:
+                return f"loss_guard_v3_adx:{adx_mix:.1f}<{min_adx:.1f}"
+
+        # 5) Early impulse must not be late from nearest swing.
+        if is_early_like and atr and atr > 0:
+            recent_high = _f(t.get("recent_high"), t.get("local_high"), t.get("range_high"), r.get("recent_high"), r.get("local_high"), default=0.0)
+            recent_low = _f(t.get("recent_low"), t.get("local_low"), t.get("range_low"), r.get("recent_low"), r.get("local_low"), default=0.0)
+            max_late = _envf("MID_LOSS_GUARD_V3_EARLY_MAX_LATE_ATR", 0.85)
+            if direction == "LONG" and recent_low > 0 and recent_low < entry:
+                late = (entry - recent_low) / max(float(atr), 1e-12)
+                if late > max_late:
+                    return f"loss_guard_v3_late_long:{late:.2f}>{max_late:.2f}"
+            if direction == "SHORT" and recent_high > 0 and recent_high > entry:
+                late = (recent_high - entry) / max(float(atr), 1e-12)
+                if late > max_late:
+                    return f"loss_guard_v3_late_short:{late:.2f}>{max_late:.2f}"
+
+        # 6) Confluence score. This catches the half-random signals: one condition can
+        # be missing, but not several at once.
+        conf = 0
+        total = 0
+        total += 1; conf += 1 if align >= 1 or not htf_tokens else 0
+        total += 1; conf += 1 if vwap_ok else 0
+        total += 1; conf += 1 if candle_dir_ok else 0
+        total += 1; conf += 1 if (vx <= 0 or vx >= min_vol) else 0
+        total += 1; conf += 1 if (b_atr <= 0 or b_atr >= min_body) else 0
+        if adx_mix is not None and not is_range_like:
+            total += 1; conf += 1 if adx_mix >= _envf("MID_LOSS_GUARD_V3_MIN_ADX_MIX", 22.0) else 0
+        if macd_v is not None:
+            total += 1
+            conf += 1 if ((direction == "LONG" and macd_v >= _envf("MID_LOSS_GUARD_V3_MACD_EPS", 0.0)) or (direction == "SHORT" and macd_v <= -_envf("MID_LOSS_GUARD_V3_MACD_EPS", 0.0))) else 0
+        need = int(_envf("MID_LOSS_GUARD_V3_EARLY_MIN_CONFLUENCE" if is_early_like else "MID_LOSS_GUARD_V3_MIN_CONFLUENCE", 5 if is_early_like else 4))
+        if total > 0 and conf < min(need, total):
+            return f"loss_guard_v3_confluence:{conf}/{total}<need{min(need,total)}"
+
+        return ""
+    except Exception as e:
+        try:
+            if _env_bool("MID_LOSS_GUARD_V3_FAIL_CLOSED", False):
+                return f"loss_guard_v3_error:{type(e).__name__}"
+        except Exception:
+            pass
+        return ""
+
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -3851,6 +4064,19 @@ def _mid_final_emit_gate_reason(*,
     _levels_reason = _mid_level_quality_veto_reason(sig=sig, ta=ta, it=it)
     if _levels_reason:
         return str(_levels_reason)
+
+    _loss_guard_reason = _mid_loss_guard_v3_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        gate_meta=gate_meta,
+        route=route,
+        vol_x=vol_x,
+        body_atr=body_atr,
+        macd_hist=macd_hist,
+    )
+    if _loss_guard_reason:
+        return str(_loss_guard_reason)
 
     _path_quality_reason = _mid_report_path_quality_guard_reason(
         sig=sig,
@@ -39827,6 +40053,19 @@ async def _backend_mid_pre_emit_block_reason(
         dir_reason = _mid_directional_contradiction_reason(ta_d, rec, meta)
         if dir_reason:
             return str(dir_reason)
+
+        loss_guard_reason = _mid_loss_guard_v3_reason(
+            sig=sig,
+            ta=ta_d,
+            it=rec,
+            gate_meta=meta,
+            route=route,
+            vol_x=vol_x,
+            body_atr=body_atr,
+            macd_hist=macd_hist,
+        )
+        if loss_guard_reason:
+            return str(loss_guard_reason)
 
         # 4) Report-driven path quality guard. This applies to direct SMC routes too,
         # because most reviewed losses passed the formal setup but had no clean path to TP1.
