@@ -2623,9 +2623,14 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
 
     sent_rows.sort(key=lambda r: (str(r.get('opened_at') or ''), int(r.get('signal_id') or 0)))
     closed_rows.sort(key=lambda r: (str(r.get('closed_at') or ''), int(r.get('signal_id') or 0)))
+    blocked_filters: Dict[str, int] = {}
+    for row in sent_rows:
+        for reason in _signal_extract_block_reasons(row.get("risk_note")):
+            blocked_filters[reason] = int(blocked_filters.get(reason) or 0) + 1
     return {
         "sent_rows": sent_rows,
         "closed_rows": closed_rows,
+        "blocked_filters": blocked_filters,
     }
 
 
@@ -2656,6 +2661,21 @@ def _signal_loss_diag_split(text_value: str | None) -> List[str]:
         item = str(part or "").strip()
         if item and item not in out:
             out.append(item)
+    return out
+
+
+def _signal_extract_block_reasons(risk_note: str | None) -> List[str]:
+    raw = str(risk_note or "")
+    if not raw:
+        return []
+    out: List[str] = []
+    for token in re.split(r"[|,; ]+", raw):
+        t = str(token or "").strip().upper()
+        if not t:
+            continue
+        if t.startswith("ADX_") or t.startswith("VOLUME_") or t.startswith("RSI_") or t.startswith("RR_") or t.startswith("TREND_") or t.startswith("VWAP_") or t.startswith("ATR_") or t.startswith("MACD_") or t.startswith("MARKET_"):
+            if t not in out:
+                out.append(t)
     return out
 
 

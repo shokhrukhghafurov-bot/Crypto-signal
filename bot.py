@@ -11267,6 +11267,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     dataset = await db_store.signal_report_window_dataset(since=since, until=until)
     sent_rows = list((dataset or {}).get("sent_rows") or [])
     closed_rows = list((dataset or {}).get("closed_rows") or [])
+    blocked_filters = dict((dataset or {}).get("blocked_filters") or {})
 
     overall = _daily_report_bucket_template()
     markets = {"SPOT": _daily_report_bucket_template(), "FUTURES": _daily_report_bucket_template()}
@@ -11363,6 +11364,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
 
     top_reasons = _daily_report_sort_counter(reason_counter, 6)
     top_weak = _daily_report_sort_counter(weak_counter, 7)
+    top_blocked_filters = sorted([(str(k), int(v)) for k, v in blocked_filters.items()], key=lambda kv: kv[1], reverse=True)[:7]
     top_zones = _daily_report_sort_counter(zone_counter, 7)
     top_metric_weak = _daily_report_sort_counter(metric_counter, 7)
     loss_examples = sorted(all_loss_rows, key=lambda r: (_daily_report_float(r.get("pnl_total_pct")), str(r.get("closed_at") or "")))[:3]
@@ -11557,6 +11559,12 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     if top_weak:
         for key, value in top_weak:
             lines.append(f"• {_daily_report_weak_label(key)} — {value}")
+    else:
+        lines.append("• —")
+    lines.extend(["", "Какие фильтры чаще всего блокировали сигналы:"])
+    if top_blocked_filters:
+        for key, value in top_blocked_filters:
+            lines.append(f"• {key} — {value}")
     else:
         lines.append("• —")
     lines.extend(["", "Какие цифры чаще всего были слабыми:"])
@@ -12151,7 +12159,28 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
-            _track_kwargs['entry_snapshot_json'] = await _signal_forensics_entry_snapshot_async(sig)
+            _entry_snap = await _signal_forensics_entry_snapshot_async(sig)
+            try:
+                _smc = dict(getattr(sig, 'smc_snapshot', {}) or {})
+            except Exception:
+                _smc = {}
+            _entry_snap['setup_name'] = str(getattr(sig, 'smc_setup_route', '') or getattr(sig, 'emit_route', '') or '').strip()
+            _entry_snap['side'] = str(getattr(sig, 'direction', '') or '').upper().strip()
+            _entry_snap['symbol'] = str(getattr(sig, 'coin', '') or '').upper().strip()
+            _entry_snap['timeframe'] = str(getattr(sig, 'timeframe', '') or '').strip()
+            _entry_snap['risk_reward'] = float(getattr(sig, 'rr', 0.0) or 0.0)
+            _entry_snap['market_regime'] = str(_smc.get('regime') or _smc.get('market_regime') or '')
+            _entry_snap['trend'] = str(_smc.get('trend') or _smc.get('trend_dir') or '')
+            _entry_snap['volume'] = float(_smc.get('vol_x') or _smc.get('volume_ratio') or 0.0)
+            _entry_snap['ADX'] = float(_smc.get('adx') or 0.0)
+            _entry_snap['RSI'] = float(_smc.get('rsi') or 0.0)
+            _entry_snap['MACD'] = float(_smc.get('macd_hist') or 0.0)
+            _entry_snap['VWAP'] = float(_smc.get('vwap') or 0.0)
+            _entry_snap['ATR'] = float(_smc.get('atr_pct') or 0.0)
+            _entry_snap['BB'] = str(_smc.get('bb_pos') or _smc.get('bb_zone') or '')
+            _entry_snap['reason_to_enter'] = str(getattr(sig, 'risk_note', '') or '').strip()
+            _entry_snap['risk_flags'] = list(_smc.get('risk_flags') or [])
+            _track_kwargs['entry_snapshot_json'] = _entry_snap
         except Exception:
             pass
         try:
@@ -17530,4 +17559,3 @@ if __name__ == "__main__":
 # ===============================
 # AUTO SYMBOL ANALYSIS HANDLER
 # ===============================
-
