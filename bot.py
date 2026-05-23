@@ -11267,6 +11267,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     dataset = await db_store.signal_report_window_dataset(since=since, until=until)
     sent_rows = list((dataset or {}).get("sent_rows") or [])
     closed_rows = list((dataset or {}).get("closed_rows") or [])
+    blocked_filters = dict((dataset or {}).get("blocked_filters") or {})
 
     overall = _daily_report_bucket_template()
     markets = {"SPOT": _daily_report_bucket_template(), "FUTURES": _daily_report_bucket_template()}
@@ -11363,6 +11364,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
 
     top_reasons = _daily_report_sort_counter(reason_counter, 6)
     top_weak = _daily_report_sort_counter(weak_counter, 7)
+    top_blocked_filters = sorted([(str(k), int(v)) for k, v in blocked_filters.items()], key=lambda kv: kv[1], reverse=True)[:7]
     top_zones = _daily_report_sort_counter(zone_counter, 7)
     top_metric_weak = _daily_report_sort_counter(metric_counter, 7)
     loss_examples = sorted(all_loss_rows, key=lambda r: (_daily_report_float(r.get("pnl_total_pct")), str(r.get("closed_at") or "")))[:3]
@@ -11559,6 +11561,12 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"• {_daily_report_weak_label(key)} — {value}")
     else:
         lines.append("• —")
+    lines.extend(["", "Какие фильтры чаще всего блокировали сигналы:"])
+    if top_blocked_filters:
+        for key, value in top_blocked_filters:
+            lines.append(f"• {key} — {value}")
+    else:
+        lines.append("• —")
     lines.extend(["", "Какие цифры чаще всего были слабыми:"])
     metric_label_map = {
         'rr_tp2': 'RR TP2 < 1.90',
@@ -11646,6 +11654,162 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
+
+
+def _last50_bucket_add(bucket: dict, row: dict) -> None:
+    st = str(row.get("status") or "").upper().strip()
+    bucket["total"] = int(bucket.get("total") or 0) + 1
+    bucket[st] = int(bucket.get(st) or 0) + 1
+    try:
+        bucket["pnl_sum"] = float(bucket.get("pnl_sum") or 0.0) + float(row.get("pnl_total_pct") or 0.0)
+    except Exception:
+        pass
+
+
+def _an_last50_norm_status(st: str) -> str:
+    s = str(st or "").upper().strip()
+    if s in ("WIN", "LOSS", "BE", "EXPIRED", "UNCERTAIN"):
+        return s
+    if s in ("CLOSED", "MANUAL_CLOSE", "SYNC_CLOSE"):
+        return "CLOSED"
+    return s or "UNKNOWN"
+
+
+def _an_last50_extract_reasons(row: dict) -> list[str]:
+    out: list[str] = []
+    for k in _daily_report_reason_codes(row):
+        kk = str(k or "").strip()
+        if kk and kk != "—" and kk not in out:
+            out.append(kk)
+    for src in (_daily_report_split_multi(row.get("weak_filters")), _daily_report_split_multi(row.get("improve_note")), _daily_report_split_multi(row.get("risk_note"))):
+        for it in src:
+            if it and it not in out:
+                out.append(it)
+    snap = row.get("entry_snapshot_json") if isinstance(row.get("entry_snapshot_json"), dict) else {}
+    if not isinstance(snap, dict):
+        snap = {}
+    adx = _daily_report_float(snap.get("ADX") or snap.get("adx"))
+    vol = _daily_report_float(snap.get("volume") or snap.get("vol_x"))
+    rsi = _daily_report_float(snap.get("RSI") or snap.get("rsi"))
+    rr = _daily_report_float(snap.get("risk_reward") or row.get("rr"))
+    atr = _daily_report_float(snap.get("ATR") or snap.get("atr_pct"))
+    trend = str(snap.get("trend") or "").upper()
+    regime = str(snap.get("market_regime") or "").upper()
+    side = str(row.get("side") or "").upper()
+    macd = _daily_report_float(snap.get("MACD") or snap.get("macd_hist"))
+    bb = str(snap.get("BB") or "").lower()
+    if adx and adx < 18:
+        out.append("ADX_TOO_LOW")
+    if vol and vol < 1.0:
+        out.append("VOLUME_TOO_LOW")
+    if rr and rr < 1.4:
+        out.append("RR_TOO_LOW")
+    if rsi and (rsi < 30 or rsi > 70):
+        out.append("RSI_BAD_ZONE")
+    if atr and atr < 0.12:
+        out.append("ATR_TOO_LOW")
+    if atr and atr > 6.5:
+        out.append("ATR_TOO_HIGH")
+    if side == "LONG" and trend in ("DOWN", "BEAR", "BEARISH"):
+        out.append("TREND_NOT_ALIGNED")
+    if side == "SHORT" and trend in ("UP", "BULL", "BULLISH"):
+        out.append("TREND_NOT_ALIGNED")
+    if side == "LONG" and macd < -0.02:
+        out.append("MACD_WEAK")
+    if side == "SHORT" and macd > 0.02:
+        out.append("MACD_WEAK")
+    if bb in ("upper_break", "lower_break"):
+        out.append("BB_BAD_POSITION")
+    if regime in ("RANGE", "CHOPPY", "SIDEWAYS"):
+        out.append("MARKET_NOT_SUITABLE")
+    return list(dict.fromkeys([x for x in out if x]))
+
+
+async def _analyze_last_closed_signals(*, limit: int = 50) -> dict:
+    rows = await db_store.get_last_closed_signals(limit=limit)
+    out = {"found": len(rows), "rows": rows, "overall": {"total": 0, "pnl_sum": 0.0}, "by_setup": {}, "by_side": {}, "by_symbol": {}, "by_route": {}, "by_setup_side": {}, "by_setup_symbol": {}, "mismatch": 0, "mismatch_rows": [], "top_loss_reasons": {}, "top_weak_filters": {}}
+    for row in rows:
+        _last50_bucket_add(out["overall"], row)
+        setup = str(_daily_report_setup_key_from_row(row) or "unknown")
+        side = str(row.get("side") or "").upper().strip() or "UNKNOWN"
+        symbol = str(row.get("symbol") or "").upper().strip() or "UNKNOWN"
+        route = str(row.get("emit_route") or "").strip() or "unknown"
+        _last50_bucket_add(out["by_setup"].setdefault(setup, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_side"].setdefault(side, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_symbol"].setdefault(symbol, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_route"].setdefault(route, {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_setup_side"].setdefault(f"{setup}|{side}", {"total": 0, "pnl_sum": 0.0}), row)
+        _last50_bucket_add(out["by_setup_symbol"].setdefault(f"{setup}|{symbol}", {"total": 0, "pnl_sum": 0.0}), row)
+        if _an_last50_norm_status(row.get("status")) == "LOSS":
+            for reason in _an_last50_extract_reasons(row):
+                out["top_loss_reasons"][reason] = int(out["top_loss_reasons"].get(reason) or 0) + 1
+            for item in _daily_report_split_multi(row.get("weak_filters")):
+                out["top_weak_filters"][item] = int(out["top_weak_filters"].get(item) or 0) + 1
+            for it in _an_last50_extract_reasons(row):
+                k = str(it).lower()
+                if any(x in k for x in ("adx", "volume", "rsi", "vwap", "atr", "rr", "trend", "macd", "bb", "market")):
+                    out["top_weak_filters"][str(it)] = int(out["top_weak_filters"].get(str(it)) or 0) + 1
+
+        # Candle-based recheck (best-effort, production-ready on Railway)
+        try:
+            side_u = str(row.get("side") or "").upper().strip()
+            tp = _daily_report_float(row.get("tp2")) or _daily_report_float(row.get("tp1"))
+            sl = _daily_report_float(row.get("sl"))
+            if tp > 0 and sl > 0 and side_u in ("LONG", "SHORT"):
+                sym = str(row.get("symbol") or "")
+                mkt = str(row.get("market") or "FUTURES")
+                tf = str(row.get("timeframe") or "5m")
+                df = await backend.load_candles(sym, tf, market=mkt, limit=400)
+                verdict = ""
+                if df is not None and not getattr(df, "empty", True):
+                    for _, c in df.tail(300).iterrows():
+                        hi = float(c.get("high") or 0.0)
+                        lo = float(c.get("low") or 0.0)
+                        if side_u == "LONG":
+                            hit_tp = hi >= tp
+                            hit_sl = lo <= sl
+                        else:
+                            hit_tp = lo <= tp
+                            hit_sl = hi >= sl
+                        if hit_tp and hit_sl:
+                            verdict = "UNCERTAIN"
+                            break
+                        if hit_tp:
+                            verdict = "WIN"
+                            break
+                        if hit_sl:
+                            verdict = "LOSS"
+                            break
+                st_db_raw = str(row.get("status") or "").upper().strip()
+                st_db = _an_last50_norm_status(st_db_raw)
+                # BE/CLOSED/EXPIRED are informational closes; do not mark as mismatch
+                if verdict and st_db in ("WIN", "LOSS", "UNCERTAIN") and verdict != st_db:
+                    out["mismatch"] = int(out.get("mismatch") or 0) + 1
+                    out["mismatch_rows"].append({
+                        "signal_id": int(row.get("signal_id") or 0),
+                        "symbol": symbol,
+                        "setup": setup,
+                        "side": side,
+                        "expected_db_status": st_db_raw,
+                        "candle_status": verdict,
+                        "reason": "tp_sl_path_conflict_or_target_selection",
+                    })
+        except Exception:
+            pass
+    # setup score + statuses
+    scored = {}
+    for k, b in (out.get("by_setup") or {}).items():
+        n = int(b.get("total") or 0); w = int(b.get("WIN") or 0); l = int(b.get("LOSS") or 0)
+        wr = (100.0 * w / max(1, (w + l))) if (w + l) > 0 else 0.0
+        pnl_avg = float(b.get("pnl_sum") or 0.0) / max(1, n)
+        sample_score = min(25.0, float(n) * 1.5)
+        pnl_score = max(-20.0, min(20.0, pnl_avg * 4.0))
+        mismatch_pen = float(sum(1 for r in out.get("mismatch_rows", []) if r.get("setup") == k)) * 3.0
+        score = wr + sample_score + pnl_score - mismatch_pen
+        status = "LOW_SAMPLE" if n < 5 else ("BAD" if (n >= 10 and wr < 45) else ("NEEDS_TUNING" if wr < 55 else "GOOD"))
+        scored[k] = {"n": n, "winrate": wr, "avg_pnl": pnl_avg, "score": score, "status": status}
+    out["setup_scores"] = scored
+    return out
 
 async def _report_bot_send_long(chat_id: int, text: str) -> None:
     if _report_bot is None:
@@ -12151,7 +12315,28 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
-            _track_kwargs['entry_snapshot_json'] = await _signal_forensics_entry_snapshot_async(sig)
+            _entry_snap = await _signal_forensics_entry_snapshot_async(sig)
+            try:
+                _smc = dict(getattr(sig, 'smc_snapshot', {}) or {})
+            except Exception:
+                _smc = {}
+            _entry_snap['setup_name'] = str(getattr(sig, 'smc_setup_route', '') or getattr(sig, 'emit_route', '') or '').strip()
+            _entry_snap['side'] = str(getattr(sig, 'direction', '') or '').upper().strip()
+            _entry_snap['symbol'] = str(getattr(sig, 'coin', '') or '').upper().strip()
+            _entry_snap['timeframe'] = str(getattr(sig, 'timeframe', '') or '').strip()
+            _entry_snap['risk_reward'] = float(getattr(sig, 'rr', 0.0) or 0.0)
+            _entry_snap['market_regime'] = str(_smc.get('regime') or _smc.get('market_regime') or '')
+            _entry_snap['trend'] = str(_smc.get('trend') or _smc.get('trend_dir') or '')
+            _entry_snap['volume'] = float(_smc.get('vol_x') or _smc.get('volume_ratio') or 0.0)
+            _entry_snap['ADX'] = float(_smc.get('adx') or 0.0)
+            _entry_snap['RSI'] = float(_smc.get('rsi') or 0.0)
+            _entry_snap['MACD'] = float(_smc.get('macd_hist') or 0.0)
+            _entry_snap['VWAP'] = float(_smc.get('vwap') or 0.0)
+            _entry_snap['ATR'] = float(_smc.get('atr_pct') or 0.0)
+            _entry_snap['BB'] = str(_smc.get('bb_pos') or _smc.get('bb_zone') or '')
+            _entry_snap['reason_to_enter'] = str(getattr(sig, 'risk_note', '') or '').strip()
+            _entry_snap['risk_flags'] = list(_smc.get('risk_flags') or [])
+            _track_kwargs['entry_snapshot_json'] = _entry_snap
         except Exception:
             pass
         try:
@@ -12441,6 +12626,77 @@ async def cmd_autotrade_stress(message: types.Message):
         for e in errs[:5]:
             txt.append(f"- `{e}`")
     await message.answer("\n".join(txt), parse_mode="Markdown")
+
+
+@dp.message(Command("analyze_last50"))
+async def cmd_analyze_last50(message: types.Message):
+    uid = int(message.from_user.id) if message and message.from_user else 0
+    if not is_admin(uid):
+        return
+    await message.answer("⏳ Running rolling-50 closed signals analysis...")
+    rep = await _analyze_last_closed_signals(limit=50)
+    overall = dict(rep.get("overall") or {})
+    win = int(overall.get("WIN") or 0); loss = int(overall.get("LOSS") or 0)
+    be = int(overall.get("BE") or 0); expired = int(overall.get("EXPIRED") or 0); uncertain = int(overall.get("UNCERTAIN") or 0)
+    total = int(overall.get("total") or 0)
+    wr = (100.0 * win / max(1, win + loss)) if (win + loss) > 0 else 0.0
+    avg_pnl = (float(overall.get("pnl_sum") or 0.0) / max(1, total)) if total > 0 else 0.0
+
+    def _top(src: dict, *, best: bool, n: int = 5) -> list[tuple[str, int, float]]:
+        arr = []
+        for k, v in (src or {}).items():
+            t = int(v.get("total") or 0); w = int(v.get("WIN") or 0); l = int(v.get("LOSS") or 0)
+            r = (100.0 * w / max(1, w + l)) if (w + l) > 0 else 0.0
+            arr.append((str(k), t, r))
+        arr = [x for x in arr if x[1] > 0]
+        arr.sort(key=lambda x: (x[2], x[1]), reverse=best)
+        return arr[:n]
+
+    setup_scores = dict(rep.get("setup_scores") or {})
+    best_setup = [x for x in _top(rep.get("by_setup") or {}, best=True) if int(setup_scores.get(x[0], {}).get("n") or 0) >= 5]
+    worst_setup = [x for x in _top(rep.get("by_setup") or {}, best=False) if int(setup_scores.get(x[0], {}).get("n") or 0) >= 5]
+    low_sample = [(k, v) for k, v in setup_scores.items() if str(v.get("status") or "") == "LOW_SAMPLE"]
+    top_reasons = sorted(list((rep.get("top_loss_reasons") or {}).items()), key=lambda kv: kv[1], reverse=True)[:5]
+    top_weak = sorted(list((rep.get("top_weak_filters") or {}).items()), key=lambda kv: kv[1], reverse=True)[:5]
+    mismatch_ratio = float(rep.get("mismatch") or 0.0) / max(1, int(rep.get("found") or 0))
+    lines = [
+        f"📊 Closed analyzed: {int(rep.get('found') or 0)}",
+        f"WIN/LOSS/BE/EXPIRED/UNCERTAIN: {win}/{loss}/{be}/{expired}/{uncertain}",
+        f"Winrate(resolved): {wr:.1f}%",
+        f"Avg PnL: {avg_pnl:+.2f}%",
+        f"Candle↔DB mismatch count: {int(rep.get('mismatch') or 0)}",
+    ]
+    if mismatch_ratio > 0.20:
+        lines.append("⚠️ DATA_QUALITY_WARNING: mismatch ratio > 20%, aggressive auto-tuning disabled.")
+    lines += [
+        "",
+        "🏆 Best setups:",
+    ]
+    lines += [f"• {k}: wr={r:.1f}% n={t}" for k, t, r in best_setup] or ["• —"]
+    lines += ["", "⚠️ Worst setups:"]
+    lines += [f"• {k}: wr={r:.1f}% n={t}" for k, t, r in worst_setup] or ["• —"]
+    lines += ["", "❌ Top LOSS reasons:"]
+    lines += [f"• {k}: {v}" for k, v in top_reasons] or ["• —"]
+    lines += ["", "🧪 Top weak filters passed:"]
+    lines += [f"• {k}: {v}" for k, v in top_weak] or ["• —"]
+    lines += ["", "🧮 Setup score board:"]
+    for k, v in sorted(setup_scores.items(), key=lambda kv: float((kv[1] or {}).get("score") or 0.0), reverse=True)[:10]:
+        lines.append(f"• {k}: n={int(v.get('n') or 0)} wr={float(v.get('winrate') or 0):.1f}% avg_pnl={float(v.get('avg_pnl') or 0):+.2f}% score={float(v.get('score') or 0):.1f} status={v.get('status')}")
+    if low_sample:
+        lines += ["", "ℹ️ LOW_SAMPLE setups:"]
+        lines += [f"• {k}: n={int(v.get('n') or 0)}" for k, v in low_sample[:5]]
+    lines += ["", "⚠️ Mismatch breakdown (top):"]
+    mm = list(rep.get("mismatch_rows") or [])[:8]
+    lines += [f"• {r.get('symbol')} | {r.get('setup')} | {r.get('side')} | db={r.get('expected_db_status')} vs candle={r.get('candle_status')} | {r.get('reason')}" for r in mm] or ["• —"]
+    sp = dict(setup_scores.get("structure_pending_trigger") or {})
+    if int(sp.get("n") or 0) >= 10 and float(sp.get("winrate") or 100.0) < 45.0:
+        lines.append(f"🚫 structure_pending_trigger is BAD: wr={float(sp.get('winrate') or 0):.1f}%, n={int(sp.get('n') or 0)}, stricter mode enabled")
+    zr = dict(setup_scores.get("zone_retest") or {})
+    if int(zr.get("n") or 0) < 5 and int(zr.get("n") or 0) > 0:
+        lines.append(f"ℹ️ zone_retest n={int(zr.get('n') or 0)} is LOW_SAMPLE, not enough data")
+    if int(rep.get("mismatch") or 0) > 0:
+        lines.append(f"⚠️ mismatch {int(rep.get('mismatch') or 0)} detected, check status interpretation")
+    await _report_bot_send_long(uid, "\n".join(lines))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
 async def lang_choose(call: types.CallbackQuery) -> None:
@@ -17530,4 +17786,3 @@ if __name__ == "__main__":
 # ===============================
 # AUTO SYMBOL ANALYSIS HANDLER
 # ===============================
-

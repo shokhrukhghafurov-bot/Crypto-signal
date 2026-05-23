@@ -2623,10 +2623,44 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
 
     sent_rows.sort(key=lambda r: (str(r.get('opened_at') or ''), int(r.get('signal_id') or 0)))
     closed_rows.sort(key=lambda r: (str(r.get('closed_at') or ''), int(r.get('signal_id') or 0)))
+    blocked_filters: Dict[str, int] = {}
+    for row in sent_rows:
+        for reason in _signal_extract_block_reasons(row.get("risk_note")):
+            blocked_filters[reason] = int(blocked_filters.get(reason) or 0) + 1
     return {
         "sent_rows": sent_rows,
         "closed_rows": closed_rows,
+        "blocked_filters": blocked_filters,
     }
+
+
+async def get_last_closed_signals(*, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return latest closed signals for rolling diagnostics."""
+    lim = max(1, min(500, int(limit or 50)))
+    try:
+        pool = get_pool()
+    except Exception:
+        return []
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, symbol, market, side, entry, tp1, tp2, sl,
+                       opened_at, closed_at, status, pnl_total_pct,
+                       setup_source, emit_route, timeframe, confidence, rr,
+                       entry_snapshot_json, close_analysis_json, weak_filters, improve_note, risk_note
+                FROM signal_tracks
+                WHERE closed_at IS NOT NULL
+                  AND status IN ('WIN','LOSS','BE','EXPIRED','UNCERTAIN','CLOSED')
+                ORDER BY closed_at DESC NULLS LAST, signal_id DESC
+                LIMIT $1;
+                """,
+                lim,
+            )
+            return [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception("get_last_closed_signals failed")
+            return []
 
 
 
@@ -2656,6 +2690,21 @@ def _signal_loss_diag_split(text_value: str | None) -> List[str]:
         item = str(part or "").strip()
         if item and item not in out:
             out.append(item)
+    return out
+
+
+def _signal_extract_block_reasons(risk_note: str | None) -> List[str]:
+    raw = str(risk_note or "")
+    if not raw:
+        return []
+    out: List[str] = []
+    for token in re.split(r"[|,; ]+", raw):
+        t = str(token or "").strip().upper()
+        if not t:
+            continue
+        if t.startswith("ADX_") or t.startswith("VOLUME_") or t.startswith("RSI_") or t.startswith("RR_") or t.startswith("TREND_") or t.startswith("VWAP_") or t.startswith("ATR_") or t.startswith("MACD_") or t.startswith("MARKET_"):
+            if t not in out:
+                out.append(t)
     return out
 
 
