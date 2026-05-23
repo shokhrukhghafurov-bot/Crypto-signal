@@ -552,7 +552,6 @@ from smart_manager_core import (
     SmartExitEngine,
     SmartPositionState,
     clamp01,
-    evaluate_setup_quality_gate,
 )
 
 ### MID AUTO-TUNE (TP2 hit-rate control)
@@ -12848,19 +12847,6 @@ def _mid_smc_route_emit_gate(*,
     diru = str(direction or "").upper().strip()
     reg_u = str(regime or "").upper().strip()
     route_prof = _mid_smc_route_requirement_profile(route_s, reg_u)
-    setup_profiles = {
-        "smc_liquidity_reclaim": {"min_confidence": 77, "min_ta_score": 68, "min_rr": 1.45, "min_adx": 18, "min_volume": 1.05, "rsi_range": (34, 70), "allowed_regimes": ["TREND", "VOLATILE_TREND", "BREAKOUT"]},
-        "smc_ob_fvg_overlap": {"min_confidence": 79, "min_ta_score": 70, "min_rr": 1.55, "min_adx": 19, "min_volume": 1.10, "rsi_range": (32, 68), "allowed_regimes": ["TREND", "BREAKOUT"]},
-        "smc_htf_ob_ltf_fvg": {"min_confidence": 80, "min_ta_score": 72, "min_rr": 1.60, "min_adx": 20, "min_volume": 1.10, "rsi_range": (32, 68), "allowed_regimes": ["TREND", "BREAKOUT"]},
-        "smc_bos_retest_confirm": {"min_confidence": 78, "min_ta_score": 69, "min_rr": 1.50, "min_adx": 20, "min_volume": 1.15, "rsi_range": (35, 67), "allowed_regimes": ["BREAKOUT", "TREND"]},
-        "smc_displacement_origin": {"min_confidence": 80, "min_ta_score": 71, "min_rr": 1.55, "min_adx": 21, "min_volume": 1.15, "rsi_range": (33, 67), "allowed_regimes": ["TREND", "BREAKOUT"]},
-        "smc_dual_fvg_origin": {"min_confidence": 81, "min_ta_score": 72, "min_rr": 1.60, "min_adx": 21, "min_volume": 1.12, "rsi_range": (33, 67), "allowed_regimes": ["TREND", "BREAKOUT"]},
-        "origin_fastpath": {"min_confidence": 82, "min_ta_score": 72, "min_rr": 1.60, "min_adx": 21, "min_volume": 1.18, "rsi_range": (35, 66), "allowed_regimes": ["BREAKOUT", "TREND"]},
-        "breakout_fastpath": {"min_confidence": 79, "min_ta_score": 69, "min_rr": 1.50, "min_adx": 20, "min_volume": 1.20, "rsi_range": (36, 66), "allowed_regimes": ["BREAKOUT"]},
-        "zone_retest": {"min_confidence": 74, "min_ta_score": 66, "min_rr": 1.40, "min_adx": 17, "min_volume": 0.95, "rsi_range": (30, 70), "allowed_regimes": ["TREND", "RANGE", "CHOPPY"]},
-        "breakout": {"min_confidence": 76, "min_ta_score": 67, "min_rr": 1.45, "min_adx": 19, "min_volume": 1.05, "rsi_range": (35, 66), "allowed_regimes": ["BREAKOUT", "TREND"]},
-        "fast_continuation": {"min_confidence": 75, "min_ta_score": 66, "min_rr": 1.40, "min_adx": 18, "min_volume": 1.00, "rsi_range": (34, 68), "allowed_regimes": ["TREND", "BREAKOUT"]},
-    }
     rr_val = None
     try:
         rr_val = float(getattr(sig, 'rr', None) if sig is not None else None)
@@ -12958,53 +12944,6 @@ def _mid_smc_route_emit_gate(*,
         meta['blocked_by'] = list(blocks)
         meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce', 'macd_hist', 'regime', 'generic_trap']
         return (False, f"smc_hard_block:{route_s}", meta)
-
-    try:
-        _sig_meta = dict(getattr(sig, "smc_snapshot", {}) or {}) if sig is not None else {}
-    except Exception:
-        _sig_meta = {}
-    setup_rule = setup_profiles.get(route_s, setup_profiles.get("fast_continuation", {}))
-    try:
-        _ta_score = float(getattr(sig, "score", 0.0) or _sig_meta.get("ta_score") or 0.0) if sig is not None else 0.0
-    except Exception:
-        _ta_score = 0.0
-    try:
-        _adx = float(_sig_meta.get("adx") or getattr(sig, "adx", 0.0) or 0.0) if sig is not None else 0.0
-    except Exception:
-        _adx = 0.0
-    try:
-        _rsi = float(_sig_meta.get("rsi") or getattr(sig, "rsi", 50.0) or 50.0) if sig is not None else 50.0
-    except Exception:
-        _rsi = 50.0
-    try:
-        _macd_hist = float(macd_hist if macd_hist is not None else (_sig_meta.get("macd_hist") or 0.0))
-    except Exception:
-        _macd_hist = 0.0
-    _bb_pos = str(_sig_meta.get("bb_pos") or _sig_meta.get("bb_zone") or "")
-    _trend = str(_sig_meta.get("trend") or _sig_meta.get("trend_dir") or "")
-    _vwap_dev = float(_sig_meta.get("vwap_dist_atr") or 0.0) if isinstance(_sig_meta, dict) else 0.0
-    _ok_quality, _blocked_quality, _quality_meta = evaluate_setup_quality_gate(
-        setup_name=route_s,
-        side=diru,
-        confidence=float(confidence or 0.0),
-        ta_score=_ta_score,
-        rr=float(rr_val or 0.0),
-        adx=_adx,
-        rsi=_rsi,
-        vol_x=float(vol_v or 0.0),
-        atr_pct=float(atr_v or 0.0),
-        macd_hist=_macd_hist,
-        trend=_trend,
-        regime=reg_u,
-        price_vs_vwap=_vwap_dev,
-        bb_pos=_bb_pos,
-        setup_rules=setup_rule,
-    )
-    meta["setup_quality"] = {"route": route_s, "ok": bool(_ok_quality), "blocked": list(_blocked_quality), **_quality_meta}
-    if not _ok_quality:
-        meta.setdefault("blocked_by", [])
-        meta["blocked_by"] = list(dict.fromkeys(list(meta.get("blocked_by") or []) + list(_blocked_quality)))
-        return (False, f"setup_quality_block:{route_s}", meta)
 
     try:
         if sig is not None:
@@ -40236,4 +40175,5 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
             logger.error("[AUTOTRADE_DIAG_LOOP_ERROR] %s\n%s", e, traceback.format_exc())
             await asyncio.sleep(10.0)
 # --- END AUTOTRADE ANOMALY WATCHDOG PATCH ---
+
 
