@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-22_v3_loss_guard_professional"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_v54_fast_continuation_rsi_relief"
 
 import asyncio
 import json
@@ -754,7 +754,7 @@ def _mid_adaptive_veto_reason(*, sig=None, ta: dict | None = None, it: dict | No
     if direction not in ('LONG', 'SHORT'):
         return ''
     try:
-        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and _env_bool('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', False):
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and _env_bool('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', True):
             return ''
     except Exception:
         pass
@@ -3709,219 +3709,6 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
-
-
-def _mid_loss_guard_v3_reason(*,
-                              sig=None,
-                              ta: dict | None = None,
-                              it: dict | None = None,
-                              gate_meta: dict | None = None,
-                              route: str | None = None,
-                              vol_x: float | None = None,
-                              body_atr: float | None = None,
-                              macd_hist: float | None = None) -> str:
-    """Final loss-reduction guard before emit.
-
-    Purpose: block the common 50/50 failure pattern where a formal setup exists,
-    but the real entry has weak directional confluence: HTF is mixed/against,
-    VWAP side is wrong, candle/volume are weak, RR is poor, or the entry is late.
-
-    This guard does not promise profit. It intentionally reduces signal count and
-    keeps only entries with stronger multi-factor agreement.
-    """
-    try:
-        if not _env_bool("MID_LOSS_GUARD_V3_ENABLED", True):
-            return ""
-    except Exception:
-        return ""
-    try:
-        t = ta if isinstance(ta, dict) else {}
-        r = it if isinstance(it, dict) else {}
-        g = gate_meta if isinstance(gate_meta, dict) else {}
-
-        def _f(*vals, default=None):
-            for v in vals:
-                try:
-                    if v is None or v == "":
-                        continue
-                    fv = float(v)
-                    if math.isfinite(fv):
-                        return fv
-                except Exception:
-                    pass
-            return default
-
-        def _s(*vals):
-            for v in vals:
-                try:
-                    if v is None:
-                        continue
-                    txt = str(v).strip()
-                    if txt:
-                        return txt
-                except Exception:
-                    pass
-            return ""
-
-        def _tok(value) -> str:
-            try:
-                x = str(value or "").strip().upper()
-            except Exception:
-                x = ""
-            if not x:
-                return ""
-            if any(k in x for k in ("LONG", "UP", "BULL", "HH", "HL", "BUY")):
-                return "LONG"
-            if any(k in x for k in ("SHORT", "DOWN", "BEAR", "LH", "LL", "SELL")):
-                return "SHORT"
-            return ""
-
-        def _envf(name: str, default: float) -> float:
-            try:
-                return float(os.getenv(name, str(default)) or default)
-            except Exception:
-                return float(default)
-
-        direction = _s(getattr(sig, "direction", None) if sig is not None else None,
-                       t.get("direction"), r.get("direction"), g.get("direction")).upper()
-        if direction not in ("LONG", "SHORT"):
-            return ""
-        market = _s(getattr(sig, "market", None) if sig is not None else None,
-                    t.get("market"), r.get("market"), g.get("market"), "FUTURES").upper()
-        setup_key = _s(route,
-                       getattr(sig, "emit_route", None) if sig is not None else None,
-                       getattr(sig, "smc_setup_route", None) if sig is not None else None,
-                       getattr(sig, "setup_source", None) if sig is not None else None,
-                       t.get("emit_route"), t.get("smc_setup_route"), t.get("setup_source"),
-                       r.get("emit_route"), r.get("smc_setup_route"), r.get("setup_source"),
-                       g.get("emit_route"), g.get("setup_key"), g.get("setup_source"))
-        setup_l = setup_key.lower()
-        is_early_like = any(x in setup_l for x in (
-            "fast_continuation", "vwap_reclaim", "trend_pullback", "breakout_retest_volume", "early", "impulse"
-        ))
-        is_range_like = any(x in setup_l for x in ("range_deviation", "range", "compression"))
-
-        # 1) Levels must be direction-consistent and worth the risk.
-        level_reason = _mid_level_quality_veto_reason(sig=sig, ta=t, it=r)
-        if level_reason:
-            return f"loss_guard_v3_levels:{level_reason}"
-
-        entry = _f(getattr(sig, "entry", None) if sig is not None else None, t.get("entry"), t.get("close"), r.get("entry"), default=0.0)
-        sl = _f(getattr(sig, "sl", None) if sig is not None else None, r.get("sl"), t.get("sl"), default=0.0)
-        tp1 = _f(getattr(sig, "tp1", None) if sig is not None else None, r.get("tp1"), t.get("tp1"), t.get("tp"), default=0.0)
-        tp2 = _f(getattr(sig, "tp2", None) if sig is not None else None, r.get("tp2"), t.get("tp2"), default=0.0)
-        if entry <= 0 or sl <= 0 or (tp1 <= 0 and tp2 <= 0):
-            return "loss_guard_v3_bad_levels"
-        target = tp2 if tp2 > 0 else tp1
-        risk = abs(entry - sl)
-        rr = abs(target - entry) / max(risk, 1e-12)
-        rr1 = abs(tp1 - entry) / max(risk, 1e-12) if tp1 > 0 else rr
-        min_rr = _envf("MID_LOSS_GUARD_V3_MIN_RR_FUTURES" if market == "FUTURES" else "MID_LOSS_GUARD_V3_MIN_RR_SPOT", 1.55 if market == "FUTURES" else 1.45)
-        min_tp1_rr = _envf("MID_LOSS_GUARD_V3_MIN_TP1_RR", 1.05)
-        if rr + 1e-12 < min_rr:
-            return f"loss_guard_v3_rr:{rr:.2f}<{min_rr:.2f}"
-        if rr1 + 1e-12 < min_tp1_rr:
-            return f"loss_guard_v3_tp1_rr:{rr1:.2f}<{min_tp1_rr:.2f}"
-
-        # 2) Context values.
-        atr = _f(t.get("atr30"), t.get("atr_abs"), r.get("atr_at_create"), g.get("atr_abs"), default=0.0)
-        vx = _f(vol_x, t.get("rel_vol"), t.get("vol_x"), r.get("rel_vol"), r.get("vol_x"), g.get("vol_x"), default=0.0)
-        b_atr = _f(body_atr, t.get("body_atr"), g.get("current_body_atr"), g.get("origin_body_atr"), default=None)
-        if b_atr is None:
-            last_body = _f(t.get("last_body"), default=None)
-            b_atr = _mid_body_atr(last_body, atr) if last_body is not None else 0.0
-        adx30 = _f(t.get("adx_30m"), t.get("adx1"), r.get("adx_30m"), r.get("adx1"), g.get("adx_30m"), default=None)
-        adx1h = _f(t.get("adx_1h"), t.get("adx4"), r.get("adx_1h"), r.get("adx4"), g.get("adx_1h"), default=None)
-        adx_vals = [x for x in (adx30, adx1h) if x is not None]
-        adx_mix = sum(adx_vals) / len(adx_vals) if adx_vals else None
-        close = _f(t.get("close"), t.get("price"), t.get("entry"), entry, default=entry)
-        open_v = _f(t.get("open"), t.get("last_open"), default=None)
-        vwap = _f(t.get("vwap"), t.get("vwap_30m"), t.get("vwap1"), r.get("vwap"), g.get("vwap"), default=None)
-        macd_v = _f(macd_hist, t.get("macd_hist"), r.get("macd_hist"), g.get("macd_hist"), default=None)
-
-        # 3) Hard directional filters.
-        htf_tokens = [
-            _tok(_s(t.get("dir4"), t.get("trend_1h"), t.get("direction_1h"), r.get("dir4"), g.get("dir4"))),
-            _tok(_s(t.get("dir1"), t.get("trend_30m"), t.get("direction_30m"), r.get("dir1"), g.get("dir1"))),
-            _tok(_s(t.get("direction_4h"), t.get("trend_4h"), r.get("direction_4h"), g.get("direction_4h"))),
-        ]
-        htf_tokens = [x for x in htf_tokens if x]
-        against = sum(1 for x in htf_tokens if x and x != direction)
-        align = sum(1 for x in htf_tokens if x == direction)
-        if against >= int(_envf("MID_LOSS_GUARD_V3_MAX_HTF_AGAINST", 1)):
-            return f"loss_guard_v3_htf_against:{against}"
-        if is_early_like and align < int(_envf("MID_LOSS_GUARD_V3_EARLY_MIN_HTF_ALIGN", 1)):
-            return f"loss_guard_v3_htf_not_aligned:{align}"
-
-        vwap_ok = True
-        if vwap is not None and vwap > 0:
-            vwap_ok = close >= float(vwap) if direction == "LONG" else close <= float(vwap)
-            if not vwap_ok:
-                return "loss_guard_v3_wrong_vwap_side"
-
-        candle_dir_ok = True
-        if open_v is not None:
-            candle_dir_ok = close > open_v if direction == "LONG" else close < open_v
-            if not candle_dir_ok:
-                return "loss_guard_v3_wrong_candle"
-
-        # 4) Minimum momentum / quality. Early impulse must be stronger.
-        min_vol = _envf("MID_LOSS_GUARD_V3_EARLY_MIN_VOL_X" if is_early_like else "MID_LOSS_GUARD_V3_MIN_VOL_X", 1.35 if is_early_like else 1.18)
-        if "fast_continuation" in setup_l:
-            min_vol = max(min_vol, _envf("MID_LOSS_GUARD_V3_FAST_MIN_VOL_X", 1.45))
-        if vx > 0 and vx + 1e-12 < min_vol:
-            return f"loss_guard_v3_volume:{vx:.2f}<{min_vol:.2f}"
-
-        min_body = _envf("MID_LOSS_GUARD_V3_EARLY_MIN_BODY_ATR" if is_early_like else "MID_LOSS_GUARD_V3_MIN_BODY_ATR", 0.18 if is_early_like else 0.12)
-        if b_atr > 0 and b_atr + 1e-12 < min_body:
-            return f"loss_guard_v3_body:{b_atr:.2f}<{min_body:.2f}"
-
-        if not is_range_like:
-            min_adx = _envf("MID_LOSS_GUARD_V3_MIN_ADX_MIX", 22.0)
-            if adx_mix is not None and adx_mix + 1e-12 < min_adx:
-                return f"loss_guard_v3_adx:{adx_mix:.1f}<{min_adx:.1f}"
-
-        # 5) Early impulse must not be late from nearest swing.
-        if is_early_like and atr and atr > 0:
-            recent_high = _f(t.get("recent_high"), t.get("local_high"), t.get("range_high"), r.get("recent_high"), r.get("local_high"), default=0.0)
-            recent_low = _f(t.get("recent_low"), t.get("local_low"), t.get("range_low"), r.get("recent_low"), r.get("local_low"), default=0.0)
-            max_late = _envf("MID_LOSS_GUARD_V3_EARLY_MAX_LATE_ATR", 0.85)
-            if direction == "LONG" and recent_low > 0 and recent_low < entry:
-                late = (entry - recent_low) / max(float(atr), 1e-12)
-                if late > max_late:
-                    return f"loss_guard_v3_late_long:{late:.2f}>{max_late:.2f}"
-            if direction == "SHORT" and recent_high > 0 and recent_high > entry:
-                late = (recent_high - entry) / max(float(atr), 1e-12)
-                if late > max_late:
-                    return f"loss_guard_v3_late_short:{late:.2f}>{max_late:.2f}"
-
-        # 6) Confluence score. This catches the half-random signals: one condition can
-        # be missing, but not several at once.
-        conf = 0
-        total = 0
-        total += 1; conf += 1 if align >= 1 or not htf_tokens else 0
-        total += 1; conf += 1 if vwap_ok else 0
-        total += 1; conf += 1 if candle_dir_ok else 0
-        total += 1; conf += 1 if (vx <= 0 or vx >= min_vol) else 0
-        total += 1; conf += 1 if (b_atr <= 0 or b_atr >= min_body) else 0
-        if adx_mix is not None and not is_range_like:
-            total += 1; conf += 1 if adx_mix >= _envf("MID_LOSS_GUARD_V3_MIN_ADX_MIX", 22.0) else 0
-        if macd_v is not None:
-            total += 1
-            conf += 1 if ((direction == "LONG" and macd_v >= _envf("MID_LOSS_GUARD_V3_MACD_EPS", 0.0)) or (direction == "SHORT" and macd_v <= -_envf("MID_LOSS_GUARD_V3_MACD_EPS", 0.0))) else 0
-        need = int(_envf("MID_LOSS_GUARD_V3_EARLY_MIN_CONFLUENCE" if is_early_like else "MID_LOSS_GUARD_V3_MIN_CONFLUENCE", 5 if is_early_like else 4))
-        if total > 0 and conf < min(need, total):
-            return f"loss_guard_v3_confluence:{conf}/{total}<need{min(need,total)}"
-
-        return ""
-    except Exception as e:
-        try:
-            if _env_bool("MID_LOSS_GUARD_V3_FAIL_CLOSED", False):
-                return f"loss_guard_v3_error:{type(e).__name__}"
-        except Exception:
-            pass
-        return ""
-
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
     """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
     try:
@@ -4064,19 +3851,6 @@ def _mid_final_emit_gate_reason(*,
     _levels_reason = _mid_level_quality_veto_reason(sig=sig, ta=ta, it=it)
     if _levels_reason:
         return str(_levels_reason)
-
-    _loss_guard_reason = _mid_loss_guard_v3_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        gate_meta=gate_meta,
-        route=route,
-        vol_x=vol_x,
-        body_atr=body_atr,
-        macd_hist=macd_hist,
-    )
-    if _loss_guard_reason:
-        return str(_loss_guard_reason)
 
     _path_quality_reason = _mid_report_path_quality_guard_reason(
         sig=sig,
@@ -12331,516 +12105,6 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
 
 
 
-# ===================== PROFESSIONAL 11-SETUP QUALITY GATE =====================
-# Purpose:
-#   The old MID scanner could let many different patterns pass through one generic
-#   score.  This gate gives every setup family its own minimum quality checklist.
-#   Result: fewer signals, more WAIT, fewer low-quality SL hits.
-#
-# Runtime toggles:
-#   MID_PRO_SETUP_RULES_ENABLED=1
-#   MID_PRO_SETUP_RULES_ENFORCE_ON_SCAN=0   # keep pending setup collection alive
-#   MID_REQUIRE_TRIGGER_HARD=1              # no sweep/BO-RT/OB/FVG/early-impulse trigger => no signal
-#   MID_EARLY_IMPULSE_TRIGGER=1             # allow first impulse candle for selected momentum setups
-
-MID_PRO_SETUP_RULES: dict[str, dict[str, object]] = {
-    # A+ institutional setups
-    "liquidity_sweep_mss_retest": {
-        "label": "Liquidity sweep + MSS/BOS + retest",
-        "min_score": 90, "min_rr": 1.60, "min_vol_x": 1.10,
-        "min_adx30": 18, "min_adx1h": 20,
-        "allowed_regimes": ("TRENDING", "EXPANSION", "RANGING"),
-        "required": ("htf_not_against", "sweep", "trigger", "confirm_candle", "tp1_path"),
-    },
-    "smc_ob_fvg_overlap": {
-        "label": "OB + FVG overlap retest",
-        "min_score": 91, "min_rr": 1.60, "min_vol_x": 1.05,
-        "min_adx30": 18, "min_adx1h": 20,
-        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
-        "required": ("htf_not_against", "retest", "confirm_candle", "vwap_side", "tp1_path"),
-    },
-    "htf_ob_ltf_fvg": {
-        "label": "HTF OB + LTF FVG retest",
-        "min_score": 90, "min_rr": 1.55, "min_vol_x": 1.05,
-        "min_adx30": 18, "min_adx1h": 21,
-        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
-        "required": ("htf_not_against", "retest", "confirm_candle", "tp1_path"),
-    },
-    "bos_retest_confirm": {
-        "label": "BOS -> retest -> confirmation",
-        "min_score": 89, "min_rr": 1.55, "min_vol_x": 1.10,
-        "min_adx30": 20, "min_adx1h": 22,
-        "allowed_regimes": ("TRENDING", "EXPANSION"),
-        "required": ("htf_align", "breakout_retest", "confirm_candle", "vwap_side", "tp1_path"),
-    },
-    "breakout_retest_volume": {
-        "label": "Breakout + retest OR early breakout impulse + volume",
-        "min_score": 88, "min_rr": 1.50, "min_vol_x": 1.20,
-        "min_adx30": 22, "min_adx1h": 22,
-        "allowed_regimes": ("TRENDING", "EXPANSION"),
-        # v2: this setup may enter at the beginning of impulse if breakout_start + volume + HTF + VWAP are valid.
-        "required": ("htf_align", "breakout_or_early", "confirm_candle", "volume", "tp1_path"),
-    },
-    "fvg_retest_trend": {
-        "label": "FVG retest with trend",
-        "min_score": 88, "min_rr": 1.50, "min_vol_x": 1.05,
-        "min_adx30": 18, "min_adx1h": 21,
-        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
-        "required": ("htf_not_against", "fvg", "confirm_candle", "tp1_path"),
-    },
-    "order_block_retest": {
-        "label": "Order block retest",
-        "min_score": 89, "min_rr": 1.55, "min_vol_x": 1.05,
-        "min_adx30": 18, "min_adx1h": 21,
-        "allowed_regimes": ("TRENDING", "EXPANSION", "COMPRESSION"),
-        "required": ("htf_not_against", "ob", "confirm_candle", "tp1_path"),
-    },
-
-    # B setups: allowed, but stricter
-    "vwap_reclaim": {
-        "label": "VWAP reclaim / hold",
-        "min_score": 91, "min_rr": 1.60, "min_vol_x": 1.25,
-        "min_adx30": 22, "min_adx1h": 22,
-        "allowed_regimes": ("TRENDING", "EXPANSION"),
-        "required": ("htf_align", "vwap_side", "confirm_candle", "volume", "tp1_path"),
-    },
-    "range_deviation_return": {
-        "label": "Range deviation return after liquidity sweep",
-        "min_score": 92, "min_rr": 1.50, "min_vol_x": 1.15,
-        "min_adx30": 0, "min_adx1h": 0,
-        "allowed_regimes": ("RANGING", "COMPRESSION"),
-        "required": ("sweep", "trigger", "confirm_candle", "tp1_path"),
-    },
-    "trend_pullback": {
-        "label": "Trend pullback to value",
-        "min_score": 92, "min_rr": 1.60, "min_vol_x": 1.15,
-        "min_adx30": 24, "min_adx1h": 24,
-        "allowed_regimes": ("TRENDING", "EXPANSION"),
-        "required": ("htf_align", "vwap_side", "confirm_candle", "no_late_entry", "tp1_path"),
-    },
-
-    # C setup: can work, but should be rare and very strict.
-    "fast_continuation": {
-        "label": "Fast continuation / STX-like signal",
-        "min_score": 94, "min_rr": 1.70, "min_vol_x": 1.45,
-        "min_adx30": 28, "min_adx1h": 26,
-        "allowed_regimes": ("TRENDING", "EXPANSION"),
-        "required": ("htf_align", "confirm_candle", "volume", "vwap_side", "no_late_entry", "tp1_path"),
-    },
-}
-
-
-def _mid_pro_is_enabled() -> bool:
-    try:
-        return _env_bool("MID_PRO_SETUP_RULES_ENABLED", True)
-    except Exception:
-        return True
-
-
-def _mid_pro_f(value, default: float = 0.0) -> float:
-    try:
-        v = float(value)
-        if math.isfinite(v):
-            return v
-    except Exception:
-        pass
-    return float(default)
-
-
-def _mid_pro_s(value) -> str:
-    try:
-        return str(value or "").strip()
-    except Exception:
-        return ""
-
-
-def _mid_pro_same_dir_sweep(ta: dict) -> bool:
-    side = _mid_pro_s(ta.get("direction")).upper()
-    return bool((side == "LONG" and ta.get("sweep_long")) or (side == "SHORT" and ta.get("sweep_short")))
-
-
-def _mid_pro_vwap_side(ta: dict) -> bool:
-    side = _mid_pro_s(ta.get("direction")).upper()
-    entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
-    vwap = _mid_pro_f(ta.get("vwap_val"), 0.0)
-    if entry <= 0 or vwap <= 0:
-        return False
-    return bool((side == "LONG" and entry >= vwap) or (side == "SHORT" and entry <= vwap))
-
-
-def _mid_pro_confirm_candle(ta: dict) -> bool:
-    side = _mid_pro_s(ta.get("direction")).upper()
-    opn = _mid_pro_f(ta.get("open"), 0.0)
-    cls = _mid_pro_f(ta.get("close") or ta.get("entry"), 0.0)
-    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
-    body = abs(cls - opn)
-    try:
-        min_body = float(os.getenv("MID_PRO_CONFIRM_BODY_ATR_MIN", os.getenv("MID_CONFIRM_CANDLE_BODY_ATR_MIN", "0.15")) or 0.15)
-    except Exception:
-        min_body = 0.15
-    if atr > 0 and (body / atr) < min_body:
-        return False
-    if side == "LONG":
-        return bool(cls > opn)
-    if side == "SHORT":
-        return bool(cls < opn)
-    return False
-
-
-def _mid_pro_no_late_entry(ta: dict) -> bool:
-    side = _mid_pro_s(ta.get("direction")).upper()
-    entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
-    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
-    if entry <= 0 or atr <= 0:
-        return False
-    try:
-        max_atr = float(os.getenv("MID_PRO_LATE_ENTRY_ATR_MAX", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35")) or 1.35)
-    except Exception:
-        max_atr = 1.35
-    recent_low = _mid_pro_f(ta.get("recent_low"), 0.0)
-    recent_high = _mid_pro_f(ta.get("recent_high"), 0.0)
-    if side == "LONG" and recent_low > 0:
-        return bool(((entry - recent_low) / atr) <= max_atr)
-    if side == "SHORT" and recent_high > 0:
-        return bool(((recent_high - entry) / atr) <= max_atr)
-    return True
-
-
-def _mid_pro_tp1_path_clear(ta: dict) -> bool:
-    """Block when TP1 is immediately behind nearest support/resistance."""
-    side = _mid_pro_s(ta.get("direction")).upper()
-    entry = _mid_pro_f(ta.get("entry"), 0.0)
-    tp1 = _mid_pro_f(ta.get("tp1"), 0.0)
-    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30"), 0.0))
-    if entry <= 0 or tp1 <= 0:
-        return False
-    try:
-        buffer_atr = float(os.getenv("MID_PRO_TP1_LEVEL_BUFFER_ATR", "0.12") or 0.12)
-    except Exception:
-        buffer_atr = 0.12
-    buf = max(atr * buffer_atr, entry * 0.0005)
-    support = _mid_pro_f(ta.get("support"), 0.0)
-    resistance = _mid_pro_f(ta.get("resistance"), 0.0)
-    if side == "LONG" and resistance > entry:
-        return bool(resistance >= (tp1 + buf))
-    if side == "SHORT" and support > 0 and support < entry:
-        return bool(support <= (tp1 - buf))
-    return True
-
-
-def _mid_pro_breakout_retest(ta: dict) -> bool:
-    txt = (_mid_pro_s(ta.get("bo_rt")) + " " + _mid_pro_s(ta.get("breakout_retest"))).upper()
-    return bool(("BO" in txt or "BREAK" in txt) and ("RETEST" in txt or "RT" in txt))
-
-
-def _mid_pro_setup_key(ta: dict) -> str:
-    """Map the current TA payload to one of the 11 professional setup families."""
-    route = _mid_pro_s(ta.get("smc_setup_route") or ta.get("emit_route")).lower()
-    src = _mid_setup_source_normalize(ta.get("setup_source") or ta.get("smart_emit_source") or ta.get("setup_source_label"))
-
-    route_map = {
-        "smc_liquidity_reclaim": "liquidity_sweep_mss_retest",
-        "liquidity_reclaim_emit": "liquidity_sweep_mss_retest",
-        "smc_ob_fvg_overlap": "smc_ob_fvg_overlap",
-        "smc_htf_ob_ltf_fvg": "htf_ob_ltf_fvg",
-        "smc_bos_retest_confirm": "bos_retest_confirm",
-        "breakout_fastpath": "breakout_retest_volume",
-        "origin_fastpath": "fast_continuation",
-        "smc_displacement_origin": "fast_continuation",
-        "smc_dual_fvg_origin": "fast_continuation",
-    }
-    if route in route_map:
-        return route_map[route]
-    if src == "fast_continuation":
-        return "fast_continuation"
-    if src == "liquidity_reclaim":
-        return "liquidity_sweep_mss_retest"
-    if src == "breakout":
-        return "breakout_retest_volume"
-    if src == "zone_retest" and ta.get("ob_retest") and ta.get("fvg_active"):
-        return "smc_ob_fvg_overlap"
-    if src == "zone_retest" and ta.get("ob_retest"):
-        return "order_block_retest"
-    if src == "zone_retest" and ta.get("fvg_active"):
-        return "fvg_retest_trend"
-
-    sweep = _mid_pro_same_dir_sweep(ta)
-    bo_rt = _mid_pro_breakout_retest(ta)
-    ob = bool(ta.get("ob_retest"))
-    fvg = bool(ta.get("fvg_active"))
-    regime = _mid_pro_s(ta.get("regime")).upper()
-    mstruct = _mid_pro_s(ta.get("mstruct")).upper()
-
-    if sweep and (bo_rt or ob or fvg):
-        return "liquidity_sweep_mss_retest"
-    if ob and fvg:
-        return "smc_ob_fvg_overlap"
-    if bo_rt and (ob or fvg):
-        return "bos_retest_confirm"
-    if bo_rt:
-        return "breakout_retest_volume"
-    if fvg:
-        return "fvg_retest_trend"
-    if ob:
-        return "order_block_retest"
-    if regime == "RANGING" and sweep:
-        return "range_deviation_return"
-    if _mid_pro_vwap_side(ta) and mstruct == "TREND":
-        return "trend_pullback"
-    if _mid_pro_vwap_side(ta):
-        return "vwap_reclaim"
-    return "fast_continuation"
-
-
-
-def _mid_pro_csv_env(name: str, default: str) -> set[str]:
-    try:
-        raw = str(os.getenv(name, default) or default)
-        return {x.strip().lower() for x in raw.split(",") if x.strip()}
-    except Exception:
-        return {x.strip().lower() for x in str(default).split(",") if x.strip()}
-
-
-def _mid_pro_breakout_start(ta: dict) -> bool:
-    """True when price is breaking the nearest level now, before a full retest exists."""
-    side = _mid_pro_s(ta.get("direction")).upper()
-    entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
-    atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30") or ta.get("atr5"), 0.0))
-    if side not in ("LONG", "SHORT") or entry <= 0:
-        return False
-    try:
-        buffer_atr = float(os.getenv("MID_EARLY_BREAKOUT_BUFFER_ATR", "0.05") or 0.05)
-    except Exception:
-        buffer_atr = 0.05
-    try:
-        buffer_pct = float(os.getenv("MID_EARLY_BREAKOUT_BUFFER_PCT", "0.0003") or 0.0003)
-    except Exception:
-        buffer_pct = 0.0003
-    buf = max(atr * max(0.0, buffer_atr), entry * max(0.0, buffer_pct))
-    resistance = _mid_pro_f(ta.get("resistance"), 0.0)
-    support = _mid_pro_f(ta.get("support"), 0.0)
-    raw = (_mid_pro_s(ta.get("bo_rt_raw")) + " " + _mid_pro_s(ta.get("breakout_retest_raw")) + " " + _mid_pro_s(ta.get("bo_rt"))).upper()
-    if "BO" in raw or "BREAK" in raw:
-        return True
-    if side == "LONG" and resistance > 0:
-        return bool(entry >= resistance + buf)
-    if side == "SHORT" and support > 0:
-        return bool(entry <= support - buf)
-    return False
-
-
-def _mid_pro_early_impulse_trigger(ta: dict, setup_key: str | None = None) -> tuple[bool, str]:
-    """Professional early trigger for setups that are supposed to enter at impulse start.
-
-    This is NOT a free pass.  It requires:
-      - selected early setup family
-      - HTF not against (or full HTF align if configured)
-      - correct VWAP side
-      - direction candle with real body
-      - volume expansion
-      - not late by ATR from recent swing
-      - optional breakout-start check for breakout setup
-    """
-    try:
-        if not _env_bool("MID_EARLY_IMPULSE_TRIGGER", True):
-            return False, "early_disabled"
-        key = str(setup_key or _mid_pro_setup_key(ta) or "").strip().lower()
-        allowed = _mid_pro_csv_env(
-            "MID_EARLY_IMPULSE_SETUPS",
-            "fast_continuation,vwap_reclaim,trend_pullback,breakout_retest_volume",
-        )
-        if key not in allowed:
-            return False, f"early_setup_not_allowed:{key or 'unknown'}"
-
-        side = _mid_pro_s(ta.get("direction")).upper()
-        if side not in ("LONG", "SHORT"):
-            return False, "early_no_side"
-
-        dir1 = _mid_pro_s(ta.get("dir1")).upper()
-        dir4 = _mid_pro_s(ta.get("dir4") or ta.get("direction")).upper()
-        try:
-            require_htf = _env_bool("MID_EARLY_IMPULSE_REQUIRE_HTF", True)
-            require_full_align = _env_bool("MID_EARLY_IMPULSE_REQUIRE_FULL_HTF_ALIGN", False)
-        except Exception:
-            require_htf, require_full_align = True, False
-        if require_htf:
-            if require_full_align:
-                if not (dir1 and dir4 and dir1 == dir4 == side):
-                    return False, f"early_htf_not_aligned:{dir1}/{dir4}/{side}"
-            else:
-                if (dir1 and dir1 not in (side, "—", "NEUTRAL")) or (dir4 and dir4 not in (side, "—", "NEUTRAL")):
-                    return False, f"early_htf_against:{dir1}/{dir4}/{side}"
-
-        if _env_bool("MID_EARLY_IMPULSE_REQUIRE_VWAP", True) and not _mid_pro_vwap_side(ta):
-            return False, "early_vwap_side_fail"
-
-        if _env_bool("MID_EARLY_IMPULSE_REQUIRE_CONFIRM_CANDLE", True) and not _mid_pro_confirm_candle(ta):
-            return False, "early_confirm_candle_fail"
-
-        vol = _mid_pro_f(ta.get("rel_vol"), 0.0)
-        try:
-            min_vol = float(os.getenv("MID_EARLY_IMPULSE_MIN_VOL_X", "1.20") or 1.20)
-        except Exception:
-            min_vol = 1.20
-        if vol < min_vol:
-            return False, f"early_vol={vol:.2f}<min={min_vol:.2f}"
-
-        entry = _mid_pro_f(ta.get("entry") or ta.get("close"), 0.0)
-        atr = abs(_mid_pro_f(ta.get("atr_abs") or ta.get("atr30") or ta.get("atr5"), 0.0))
-        recent_low = _mid_pro_f(ta.get("recent_low"), 0.0)
-        recent_high = _mid_pro_f(ta.get("recent_high"), 0.0)
-        try:
-            max_late = float(os.getenv("MID_EARLY_IMPULSE_MAX_LATE_ATR", "0.90") or 0.90)
-        except Exception:
-            max_late = 0.90
-        if entry > 0 and atr > 0:
-            if side == "LONG" and recent_low > 0:
-                late_atr = (entry - recent_low) / atr
-                if late_atr > max_late:
-                    return False, f"early_late_long_atr={late_atr:.2f}>{max_late:.2f}"
-            if side == "SHORT" and recent_high > 0:
-                late_atr = (recent_high - entry) / atr
-                if late_atr > max_late:
-                    return False, f"early_late_short_atr={late_atr:.2f}>{max_late:.2f}"
-
-        if key == "breakout_retest_volume" and not (_mid_pro_breakout_retest(ta) or _mid_pro_breakout_start(ta)):
-            return False, "early_breakout_start_fail"
-
-        if bool(ta.get("post_impulse_block")) and _env_bool("MID_EARLY_IMPULSE_BLOCK_POST_IMPULSE", True):
-            return False, "early_post_impulse_block"
-
-        return True, f"early_impulse_ok:{key}"
-    except Exception as e:
-        return False, f"early_error:{type(e).__name__}"
-
-
-def _mid_pro_check_required(name: str, ta: dict) -> tuple[bool, str]:
-    side = _mid_pro_s(ta.get("direction")).upper()
-    dir1 = _mid_pro_s(ta.get("dir1")).upper()
-    dir4 = _mid_pro_s(ta.get("dir4") or ta.get("direction")).upper()
-    if name == "htf_align":
-        return (bool(dir1 and dir4 and dir1 == dir4 == side), "htf_align")
-    if name == "htf_not_against":
-        return (bool((not dir4) or dir4 == side), "htf_not_against")
-    if name == "sweep":
-        return (_mid_pro_same_dir_sweep(ta), "liquidity_sweep")
-    if name == "trigger":
-        early_ok, _early_reason = _mid_pro_early_impulse_trigger(ta)
-        ok = bool(_mid_pro_same_dir_sweep(ta) or _mid_pro_breakout_retest(ta) or ta.get("ob_retest") or ta.get("fvg_active") or early_ok)
-        return (ok, "execution_trigger")
-    if name == "early_impulse":
-        ok, reason = _mid_pro_early_impulse_trigger(ta)
-        return (ok, reason or "early_impulse")
-    if name == "breakout_or_early":
-        early_ok, _early_reason = _mid_pro_early_impulse_trigger(ta, "breakout_retest_volume")
-        return (bool(_mid_pro_breakout_retest(ta) or early_ok), "breakout_or_early_impulse")
-    if name == "breakout_retest":
-        return (_mid_pro_breakout_retest(ta), "breakout_retest")
-    if name == "retest":
-        return (bool(_mid_pro_breakout_retest(ta) or ta.get("ob_retest") or ta.get("fvg_active")), "retest")
-    if name == "ob":
-        return (bool(ta.get("ob_retest")), "order_block_retest")
-    if name == "fvg":
-        return (bool(ta.get("fvg_active")), "fvg_retest")
-    if name == "confirm_candle":
-        return (_mid_pro_confirm_candle(ta), "confirm_candle")
-    if name == "volume":
-        try:
-            min_v = float(os.getenv("MID_PRO_MIN_VOL_X", "1.15") or 1.15)
-        except Exception:
-            min_v = 1.15
-        return (_mid_pro_f(ta.get("rel_vol"), 0.0) >= min_v, "volume")
-    if name == "vwap_side":
-        return (_mid_pro_vwap_side(ta), "vwap_side")
-    if name == "no_late_entry":
-        return (_mid_pro_no_late_entry(ta), "no_late_entry")
-    if name == "tp1_path":
-        return (_mid_pro_tp1_path_clear(ta), "tp1_path_clear")
-    return (True, name)
-
-
-def _mid_professional_setup_gate(ta: dict, *, market: str = "FUTURES", symbol: str = "") -> tuple[bool, str, dict]:
-    """Return (allowed, reason, meta).  Designed to be called after SL/TP are built."""
-    meta: dict[str, object] = {}
-    if not _mid_pro_is_enabled():
-        return True, "disabled", meta
-    if not isinstance(ta, dict) or not ta:
-        return False, "professional_gate:no_ta", meta
-
-    setup_key = _mid_pro_setup_key(ta)
-    rule = dict(MID_PRO_SETUP_RULES.get(setup_key) or MID_PRO_SETUP_RULES["fast_continuation"])
-    meta["setup_key"] = setup_key
-    meta["setup_label"] = str(rule.get("label") or setup_key)
-
-    try:
-        _phase = str(_MID_EVAL_PHASE.get() or "scan").lower()
-    except Exception:
-        _phase = "scan"
-    try:
-        pending_enabled = _env_bool("MID_PENDING_ENABLED", False)
-        postsetup_only = _env_bool("MID_FILTERS_AFTER_SETUP", True)
-        enforce_on_scan = _env_bool("MID_PRO_SETUP_RULES_ENFORCE_ON_SCAN", False)
-    except Exception:
-        pending_enabled, postsetup_only, enforce_on_scan = False, True, False
-    if _phase == "scan" and pending_enabled and postsetup_only and not enforce_on_scan:
-        meta["deferred"] = True
-        return True, "deferred_to_trigger", meta
-
-    score = _mid_pro_f(ta.get("confidence") or ta.get("ta_score_conf") or ta.get("ta_score"), 0.0)
-    rr = _mid_pro_f(ta.get("rr"), 0.0)
-    vol = _mid_pro_f(ta.get("rel_vol"), 0.0)
-    adx30 = _mid_pro_f(ta.get("adx1"), 0.0)
-    adx1h = _mid_pro_f(ta.get("adx4"), 0.0)
-    regime = _mid_pro_s(ta.get("regime")).upper() or "—"
-
-    # Optional global overrides keep tuning simple from Railway/.env.
-    min_score = max(_mid_pro_f(rule.get("min_score"), 90.0), _mid_pro_f(os.getenv("MID_PRO_MIN_SCORE", 0.0), 0.0))
-    min_rr = max(_mid_pro_f(rule.get("min_rr"), 1.5), _mid_pro_f(os.getenv("MID_PRO_MIN_RR", 0.0), 0.0))
-    min_vol = max(_mid_pro_f(rule.get("min_vol_x"), 1.0), _mid_pro_f(os.getenv("MID_PRO_MIN_VOL_X", 0.0), 0.0))
-    min_adx30 = max(_mid_pro_f(rule.get("min_adx30"), 0.0), _mid_pro_f(os.getenv("MID_PRO_MIN_ADX_30M", 0.0), 0.0))
-    min_adx1h = max(_mid_pro_f(rule.get("min_adx1h"), 0.0), _mid_pro_f(os.getenv("MID_PRO_MIN_ADX_1H", 0.0), 0.0))
-
-    checks = {
-        "score": score, "rr": rr, "vol_x": vol, "adx30": adx30, "adx1h": adx1h, "regime": regime,
-    }
-    meta["checks"] = checks
-
-    allowed_regimes = tuple(str(x).upper() for x in (rule.get("allowed_regimes") or ()))
-    if allowed_regimes and regime not in allowed_regimes:
-        return False, f"professional_gate:{setup_key}:regime={regime}:allowed={','.join(allowed_regimes)}", meta
-    if score < min_score:
-        return False, f"professional_gate:{setup_key}:score={score:.0f}<min={min_score:.0f}", meta
-    if rr < min_rr:
-        return False, f"professional_gate:{setup_key}:rr={rr:.2f}<min={min_rr:.2f}", meta
-    if vol < min_vol:
-        return False, f"professional_gate:{setup_key}:vol_x={vol:.2f}<min={min_vol:.2f}", meta
-    if adx30 < min_adx30:
-        return False, f"professional_gate:{setup_key}:adx30={adx30:.1f}<min={min_adx30:.1f}", meta
-    if adx1h < min_adx1h:
-        return False, f"professional_gate:{setup_key}:adx1h={adx1h:.1f}<min={min_adx1h:.1f}", meta
-
-    for req in tuple(rule.get("required") or ()):  # route-specific checklist
-        ok, label = _mid_pro_check_required(str(req), ta)
-        if not ok:
-            return False, f"professional_gate:{setup_key}:missing_{label}", meta
-
-    # Explicit no-trigger risk flag is blocked unless this setup has a valid v2 early-impulse trigger.
-    try:
-        flags = [str(x).lower() for x in (ta.get("risk_flags") or [])]
-        if "no_trigger" in flags and _env_bool("MID_REQUIRE_TRIGGER_HARD", True):
-            early_ok, early_reason = _mid_pro_early_impulse_trigger(ta, setup_key)
-            meta["early_impulse_ok"] = bool(early_ok)
-            meta["early_impulse_reason"] = str(early_reason or "")
-            if not early_ok:
-                return False, f"professional_gate:{setup_key}:risk_no_trigger", meta
-    except Exception:
-        pass
-
-    return True, "ok", meta
-
-# =================== END PROFESSIONAL 11-SETUP QUALITY GATE ===================
-
-
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
     base = _mid_setup_source_label(setup_source)
     # FAST CONTINUATION is a user-facing setup profile, not a route suffix. Keep
@@ -18747,10 +18011,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ob_retest = False
     eq_hi = None
     eq_lo = None
-    # v2 early-impulse trigger: lets selected momentum setups enter at impulse start,
-    # without waiting for a late retest. It is still filtered by HTF/VWAP/volume/late-entry.
-    early_impulse_trigger_ok = False
-    early_impulse_trigger_reason = ""
 
     try:
         use_regime = _mid_bool_env("MID_USE_REGIME", "1")
@@ -18817,7 +18077,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     if (not np.isnan(lo5)) and (not np.isnan(hi5)):
                         ob_retest = (hi5 >= zlo - tol) and (lo5 <= zhi + tol)
                 except Exception:
-                    ob_retest = False        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB/FVG retests.
+                    ob_retest = False        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB retests.
         if use_regime and mid_regime == "RANGING":
             if bo_rt_trigger and (not (sweep_long or sweep_short) and (not ob_retest)):
                 # prevent range fake breakouts
@@ -18832,53 +18092,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     base_r.setdefault("risk_flags", [])
                     base_r["risk_flags"].append("regime_range_no_breakout")
                 except Exception:
-                    pass
-
-        # PROFESSIONAL MODE v2:
-        # No real execution trigger = no final signal, EXCEPT selected early-impulse setups
-        # that pass HTF + VWAP + confirmation candle + volume + not-late checks.
+                    pass        # Require-trigger now works as a score component, not as a hard setup gate.
+        # If there is no execution trigger yet, we keep only a soft risk flag and let
+        # the score layer apply a small penalty instead of killing the setup.
         if require_trigger:
+            trig_ok = False
             if str(dir_trend).upper() == "LONG":
                 trig_ok = bool(sweep_long) or bool(bo_rt_trigger) or bool(ob_retest)
             else:
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
-
-            try:
-                # FVG retest is also a valid professional trigger, but only if it is active now.
-                trig_ok = bool(trig_ok or fvg_active)
-            except Exception:
-                pass
-
-            if not trig_ok:
-                try:
-                    _early_ta = {
-                        "direction": dir_trend,
-                        "entry": float(entry),
-                        "close": float(entry),
-                        "open": float(last5.get("open", entry) or entry),
-                        "atr30": float(atr30),
-                        "atr_abs": float(atr30),
-                        "atr5": float(atr5),
-                        "rel_vol": float(vol_rel if (not np.isnan(vol_rel)) else 0.0),
-                        "vwap_val": float(vwap_val if (not np.isnan(vwap_val)) else 0.0),
-                        "dir1": dir_mid,
-                        "dir4": dir_trend,
-                        "support": sup_lvl,
-                        "resistance": res_lvl,
-                        "recent_low": recent_low,
-                        "recent_high": recent_high,
-                        "regime": mid_regime,
-                        "bo_rt": bo_rt_label,
-                        "bo_rt_raw": bo_rt_meta.get("label") if isinstance(bo_rt_meta, dict) else "",
-                        "breakout_retest": bo_rt_label,
-                        "post_impulse_block": _mid_consecutive_candles(df5i, direction=str(dir_trend), n=int(float(os.getenv("MID_EARLY_IMPULSE_POST_N", "3") or 3))),
-                    }
-                    early_impulse_trigger_ok, early_impulse_trigger_reason = _mid_pro_early_impulse_trigger(_early_ta)
-                    trig_ok = bool(early_impulse_trigger_ok)
-                except Exception as _early_exc:
-                    early_impulse_trigger_ok = False
-                    early_impulse_trigger_reason = f"early_error:{type(_early_exc).__name__}"
-
             if not trig_ok:
                 try:
                     base_r.setdefault("risk_flags", [])
@@ -18886,17 +18108,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                         base_r["risk_flags"].append("no_trigger")
                 except Exception:
                     pass
-
-                try:
-                    _phase = str(_MID_EVAL_PHASE.get() or "scan").lower()
-                except Exception:
-                    _phase = "scan"
-
-                hard_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER_HARD", "1")
-                defer_scan = bool(pending_enabled and postsetup_only and _phase == "scan")
-                if hard_trigger and not defer_scan:
-                    _fail("structure", "no_execution_trigger")
-                    return None
     except Exception:
         # Never block if engine fails unexpectedly.
         pass
@@ -19767,9 +18978,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "ob_retest": bool(ob_retest),
         "fvg": fvg_kind,
         "fvg_active": bool(fvg_active),
-        "early_impulse_trigger": bool(early_impulse_trigger_ok),
-        "early_impulse_reason": str(early_impulse_trigger_reason or ""),
-        "post_impulse_block": _mid_consecutive_candles(df5i, direction=str(dir_trend), n=int(float(os.getenv("MID_EARLY_IMPULSE_POST_N", "3") or 3))),
         "mid_bonus": float(mid_bonus),
         "mid_bonus_parts": dict(mid_bonus_parts) if isinstance(mid_bonus_parts, dict) else {},
         "channel": channel,
@@ -19799,22 +19007,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             ta["level_engine"] = "STRUCTURE_FIRST"
     except Exception:
         pass
-    # Professional 11-setup gate: final quality checklist after SL/TP are finalized.
-    try:
-        _pro_ok, _pro_reason, _pro_meta = _mid_professional_setup_gate(ta, market=str(market or "FUTURES"), symbol=str(symbol or ""))
-        ta["professional_setup_key"] = str((_pro_meta or {}).get("setup_key") or "")
-        ta["professional_setup_label"] = str((_pro_meta or {}).get("setup_label") or "")
-        ta["professional_gate_reason"] = str(_pro_reason or "")
-        if not _pro_ok:
-            _fail("quality_guard", str(_pro_reason or "professional_gate"))
-            return None
-    except Exception as _pro_exc:
-        # Fail-open only if the gate itself crashes; use logs for debugging.
-        try:
-            logger.warning("[mid][professional-gate] %s failed: %s", symbol, _pro_exc)
-        except Exception:
-            pass
-
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
@@ -40053,19 +39245,6 @@ async def _backend_mid_pre_emit_block_reason(
         dir_reason = _mid_directional_contradiction_reason(ta_d, rec, meta)
         if dir_reason:
             return str(dir_reason)
-
-        loss_guard_reason = _mid_loss_guard_v3_reason(
-            sig=sig,
-            ta=ta_d,
-            it=rec,
-            gate_meta=meta,
-            route=route,
-            vol_x=vol_x,
-            body_atr=body_atr,
-            macd_hist=macd_hist,
-        )
-        if loss_guard_reason:
-            return str(loss_guard_reason)
 
         # 4) Report-driven path quality guard. This applies to direct SMC routes too,
         # because most reviewed losses passed the formal setup but had no clean path to TP1.
