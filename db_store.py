@@ -2360,7 +2360,9 @@ def _signal_report_extract_setup_from_text(text: str | None) -> str:
 
 def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, emit_route: str | None = None, setup_source_label: str | None = None, setup_source: str | None = None, orig_text: str | None = None, risk_note: str | None = None) -> str:
     raw = ""
-    for candidate in (ui_setup_label, emit_route, setup_source_label, setup_source, _signal_report_extract_setup_from_text(risk_note), _signal_report_extract_setup_from_text(orig_text)):
+    # Prefer exact route over generic labels so smart-route rows also land in the
+    # correct high-level setup bucket.
+    for candidate in (emit_route, ui_setup_label, setup_source_label, setup_source, _signal_report_extract_setup_from_text(risk_note), _signal_report_extract_setup_from_text(orig_text)):
         try:
             c = str(candidate or "").strip()
         except Exception:
@@ -2394,6 +2396,21 @@ def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, e
         "liquidity_reclaim_emit": "liquidity_reclaim",
         "liquidity_reclaim_entry": "liquidity_reclaim",
         "liquidity_reclaim_ready": "liquidity_reclaim",
+        "smc_liquidity_reclaim": "liquidity_reclaim",
+        "liquidity_sweep_reclaim_bos_continuation": "liquidity_reclaim",
+        "smc_ob_fvg_overlap": "origin",
+        "ob_fvg_priority_emit": "origin",
+        "origin_ob_fvg_priority_emit": "origin",
+        "smc_displacement_origin": "origin",
+        "displacement_origin_fast_path": "origin",
+        "smc_dual_fvg_origin": "origin",
+        "dual_stacked_fvg_origin": "origin",
+        "smc_bos_retest_confirm": "breakout",
+        "bos_fvg_ob_retest_confirm": "breakout",
+        "breakout_bos_fvg_ob_retest_confirm": "breakout",
+        "smc_htf_ob_ltf_fvg": "zone_retest",
+        "htf_ob_ltf_fvg_retest_emit": "zone_retest",
+        "zone_retest_htf_ob_ltf_fvg_retest_emit": "zone_retest",
         "fast_continuation": "fast_continuation",
         "fast_continuation_stx": "fast_continuation",
         "fast_continuation_stx_like": "fast_continuation",
