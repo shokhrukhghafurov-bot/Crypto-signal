@@ -10843,13 +10843,38 @@ def _daily_report_quality(bucket: dict) -> int:
     return max(35, min(99, int(round(raw))))
 
 
+def _daily_report_resolved_count(bucket: dict) -> int:
+    b = dict(bucket or {})
+    return (
+        _daily_report_int(b.get("win"))
+        + _daily_report_int(b.get("loss"))
+        + _daily_report_int(b.get("be"))
+        + _daily_report_int(b.get("manual_close"))
+    )
+
+
+def _daily_report_win_loss_count(bucket: dict) -> int:
+    b = dict(bucket or {})
+    return _daily_report_int(b.get("win")) + _daily_report_int(b.get("loss"))
+
+
+def _daily_report_no_result_count(bucket: dict) -> int:
+    # Signals included in the report but not resolved inside the report window.
+    # This is the number that was previously missing from the report.
+    return max(0, _daily_report_int((bucket or {}).get("sent")) - _daily_report_resolved_count(bucket or {}))
+
+
 def _daily_report_setup_has_data(bucket: dict) -> bool:
     b = dict(bucket or {})
-    return (_daily_report_int(b.get("sent")) > 0) or ((_daily_report_int(b.get("win")) + _daily_report_int(b.get("loss")) + _daily_report_int(b.get("be")) + _daily_report_int(b.get("manual_close"))) > 0)
+    return (_daily_report_int(b.get("sent")) > 0) or (_daily_report_resolved_count(b) > 0)
 
 
 def _daily_report_render_quality(bucket: dict) -> str:
     return f"{_daily_report_quality(bucket)}/100" if _daily_report_setup_has_data(bucket) else "—"
+
+
+def _daily_report_render_winrate(bucket: dict, *, digits: int = 1, strip_zero: bool = False) -> str:
+    return _daily_report_pct(_daily_report_winrate(bucket), digits=digits, strip_zero=strip_zero) if _daily_report_win_loss_count(bucket) > 0 else "—"
 
 
 def _daily_report_weak_label(key: str) -> str:
@@ -10991,8 +11016,80 @@ def _daily_report_split_multi(value: str | None) -> list[str]:
     return out
 
 
+def _daily_report_normalize_setup_key(value: str | None) -> str:
+    """Normalize any UI label / route key into the 5 daily report setup buckets."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    s = raw.lower().replace("→", " ").replace("|", " ")
+    s = s.replace("-", "_").replace("/", "_").replace("+", "_").replace("&", "_")
+    s = re.sub(r"[^a-z0-9а-яё_\s]+", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[\s_]+", "_", s).strip("_")
+    aliases = {
+        # Canonical buckets
+        "origin": "origin",
+        "origin_fast": "origin",
+        "origin_fastpass": "origin",
+        "начало_движения": "origin",
+        "breakout": "breakout",
+        "breakout_fast": "breakout",
+        "breakout_fastpass": "breakout",
+        "пробой": "breakout",
+        "zone": "zone_retest",
+        "zone_retest": "zone_retest",
+        "zone_touch": "zone_retest",
+        "zone_touch_retest": "zone_retest",
+        "возврат_в_зону": "zone_retest",
+        "normal_pending": "normal_pending_trigger",
+        "normal_pending_trigger": "normal_pending_trigger",
+        "structure_pending_trigger": "normal_pending_trigger",
+        "pending": "normal_pending_trigger",
+        "pending_trigger": "normal_pending_trigger",
+        "обычный_trigger": "normal_pending_trigger",
+        "обычный_триггер": "normal_pending_trigger",
+        "обычный_pending_trigger": "normal_pending_trigger",
+        "liquidity_reclaim": "liquidity_reclaim",
+        "liquidity_reclaim_emit": "liquidity_reclaim",
+        "liquidity_reclaim_entry": "liquidity_reclaim",
+        "liquidity_reclaim_ready": "liquidity_reclaim",
+        # Exact SMC routes -> setup buckets. This fixes daily setup counters.
+        "smc_ob_fvg_overlap": "origin",
+        "ob_fvg_priority_emit": "origin",
+        "origin_ob_fvg_priority_emit": "origin",
+        "smc_displacement_origin": "origin",
+        "displacement_origin_fast_path": "origin",
+        "smc_dual_fvg_origin": "origin",
+        "dual_stacked_fvg_origin": "origin",
+        "smc_bos_retest_confirm": "breakout",
+        "bos_fvg_ob_retest_confirm": "breakout",
+        "breakout_bos_fvg_ob_retest_confirm": "breakout",
+        "smc_htf_ob_ltf_fvg": "zone_retest",
+        "htf_ob_ltf_fvg_retest_emit": "zone_retest",
+        "zone_retest_htf_ob_ltf_fvg_retest_emit": "zone_retest",
+        "smc_liquidity_reclaim": "liquidity_reclaim",
+        "liquidity_sweep_reclaim_bos_continuation": "liquidity_reclaim",
+    }
+    return aliases.get(s, "")
+
+
 def _daily_report_setup_key_from_row(row: dict) -> str:
-    return str(_report_setup_label_from_row(row) or "").strip().lower().replace(" ", "_")
+    src = dict(row or {})
+    # Prefer exact route fields over generic UI labels. Otherwise rows with
+    # `smc_ob_fvg_overlap` / `smc_bos_retest_confirm` were counted in route
+    # analytics but disappeared from the main Setup-анализ block.
+    for candidate in (
+        src.get("smc_setup_route"),
+        src.get("emit_route"),
+        src.get("smc_setup_label"),
+        src.get("ui_setup_label"),
+        _report_setup_label_from_row(src),
+        src.get("setup_source_label"),
+        src.get("setup_source"),
+    ):
+        key = _daily_report_normalize_setup_key(candidate)
+        if key:
+            return key
+    return ""
 
 
 def _daily_report_row_confirmations(row: dict) -> int:
@@ -11370,7 +11467,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     market_best = ""
     market_best_score = None
     for key, bucket in markets.items():
-        if _daily_report_int(bucket.get("sent")) <= 0:
+        if _daily_report_resolved_count(bucket) <= 0:
             continue
         score = (_daily_report_quality(bucket), _daily_report_winrate(bucket), _daily_report_float(bucket.get("sum_pnl_pct")))
         if market_best_score is None or score > market_best_score:
@@ -11380,7 +11477,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     side_best = ""
     side_best_score = None
     for key, bucket in sides.items():
-        if _daily_report_int(bucket.get("sent")) <= 0:
+        if _daily_report_resolved_count(bucket) <= 0:
             continue
         score = (_daily_report_quality(bucket), _daily_report_winrate(bucket), _daily_report_float(bucket.get("sum_pnl_pct")))
         if side_best_score is None or score > side_best_score:
@@ -11441,11 +11538,13 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         f"❌ LOSS: {_daily_report_int(overall.get('loss'))}",
         f"🟡 BE: {_daily_report_int(overall.get('be'))}",
         f"⚪ CLOSED: {_daily_report_int(overall.get('manual_close'))}",
+        f"📌 Закрыто результатов: {_daily_report_resolved_count(overall)}",
+        f"⏳ Без результата: {_daily_report_no_result_count(overall)}",
         "",
-        f"📈 Winrate: {_daily_report_pct(overall_winrate, digits=1)}",
+        f"📈 Winrate: {_daily_report_render_winrate(overall, digits=1)}",
         f"💰 Общий PnL: {_report_pnl_pct(overall_pnl)}",
         f"⚖️ Средний RR: {f'1:{avg_rr:.2f}' if avg_rr > 0 else '1:0.00'}",
-        f"🎯 Точность входов: {_daily_report_pct(entry_accuracy, digits=0, strip_zero=True)}",
+        f"🎯 Точность входов: {_daily_report_pct(entry_accuracy, digits=0, strip_zero=True) if denom > 0 else '—'}",
         f"🛡 Качество фильтров: {overall_quality}/100",
         "",
         sep,
@@ -11463,8 +11562,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"🟡 BE: {_daily_report_int(bucket.get('be'))}")
         if _daily_report_int(bucket.get('manual_close')):
             lines.append(f"⚪ CLOSED: {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"⏳ Без результата: {_daily_report_no_result_count(bucket)}")
         lines.append(f"💰 PnL: {_report_pnl_pct(_daily_report_float(bucket.get('sum_pnl_pct')))}")
-        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1)}")
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(bucket, digits=1)}")
         lines.append("")
 
     lines.extend([sep, "📈 Направления", ""])
@@ -11478,8 +11578,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"🟡 BE: {_daily_report_int(bucket.get('be'))}")
         if _daily_report_int(bucket.get('manual_close')):
             lines.append(f"⚪ CLOSED: {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"⏳ Без результата: {_daily_report_no_result_count(bucket)}")
         lines.append(f"💰 PnL: {_report_pnl_pct(_daily_report_float(bucket.get('sum_pnl_pct')))}")
-        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1)}")
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(bucket, digits=1)}")
         lines.append("")
 
     lines.extend([sep, "🧠 Setup-анализ", ""])
@@ -11489,11 +11590,11 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append(f"Всего: {_daily_report_int(bucket.get('sent'))}")
         lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
         lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
-        no_result = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
-        if no_result:
-            lines.append(f"🟡/⚪ Без результата: {no_result}")
-        if _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss')) > 0:
-            lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1, strip_zero=True)}")
+        no_result = _daily_report_no_result_count(bucket)
+        lines.append(f"⏳ Без результата: {no_result}")
+        if _daily_report_int(bucket.get('be')) or _daily_report_int(bucket.get('manual_close')):
+            lines.append(f"🟡 BE / ⚪ CLOSED: {_daily_report_int(bucket.get('be'))} / {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(bucket, digits=1, strip_zero=True)}")
         lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
 
@@ -11518,35 +11619,72 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
         wr = _daily_report_winrate(bucket)
         pnl_sum = _daily_report_float(bucket.get('sum_pnl_pct'))
-        be_closed = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
+        no_result = _daily_report_no_result_count(bucket)
 
         lines.append(route_title)
         lines.append(f"Route key: {route_key}")
         lines.append(f"Всего: {sent_n}")
         lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
         lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
-        lines.append(f"🟡/⚪️ Без результата: {be_closed}")
+        if _daily_report_int(bucket.get('be')) or _daily_report_int(bucket.get('manual_close')):
+            lines.append(f"🟡 BE / ⚪ CLOSED: {_daily_report_int(bucket.get('be'))} / {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"⏳ Без результата: {no_result}")
         lines.append(f"📈 Winrate: {_daily_report_pct(wr, digits=1)}" if resolved_n > 0 else "📈 Winrate: —")
         lines.append(f"💰 PnL: {_report_pnl_pct(pnl_sum)}")
         lines.append("")
+
+    displayed_route_keys = {key for key, _ in exact_route_specs}
+    other_route_items = [
+        (key, bucket)
+        for key, bucket in smart_routes_map.items()
+        if key not in displayed_route_keys and _daily_report_int((bucket or {}).get('sent')) > 0
+    ]
+    other_route_items.sort(key=lambda kv: (-_daily_report_int((kv[1] or {}).get('sent')), str(kv[0])))
+    for route_key, bucket in other_route_items[:10]:
+        exact_route_has_data = True
+        sent_n = _daily_report_int(bucket.get('sent'))
+        resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
+        lines.append("Other smart route")
+        lines.append(f"Route key: {route_key}")
+        lines.append(f"Всего: {sent_n}")
+        lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+        lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+        if _daily_report_int(bucket.get('be')) or _daily_report_int(bucket.get('manual_close')):
+            lines.append(f"🟡 BE / ⚪ CLOSED: {_daily_report_int(bucket.get('be'))} / {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"⏳ Без результата: {_daily_report_no_result_count(bucket)}")
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(bucket, digits=1)}" if resolved_n > 0 else "📈 Winrate: —")
+        lines.append(f"💰 PnL: {_report_pnl_pct(_daily_report_float(bucket.get('sum_pnl_pct')))}")
+        lines.append("")
+
+    if len(other_route_items) > 10:
+        rest_sent = sum(_daily_report_int((b or {}).get('sent')) for _, b in other_route_items[10:])
+        lines.extend([f"Other smart routes ещё: {len(other_route_items) - 10} route, сигналов: {rest_sent}", ""])
 
     if not exact_route_has_data:
         lines.extend(["—", ""])
 
     lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
-    for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
-        lines.append(f"• {item}")
-    lines.extend(["", "Итог:"])
     if best_setup_key:
-        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(best_setup_bucket), digits=1, strip_zero=True)}")
-    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {worst_setup_key or '—'}", "Почему слабый:"])
-    for item in _daily_report_worst_setup_reasons(worst_setup_key)[:3]:
-        lines.append(f"• {item}")
-    lines.extend(["", "Итог:"])
+        for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
+            lines.append(f"• {item}")
+        lines.extend(["", "Итог:"])
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(best_setup_bucket, digits=1, strip_zero=True)}")
+        lines.append("💰 Лучший вклад в PnL дня")
+        lines.append("🛡 Самый стабильный setup")
+    else:
+        lines.append("• нет закрытых WIN/LOSS/BE/CLOSED результатов в этом окне")
+        lines.append("• лучший сетап по факту результата определить нельзя")
+    lines.extend(["", sep, "⚠️ Худший сетап дня", "", f"🥀 {worst_setup_key or '—'}", "Почему слабый:"])
     if worst_setup_key:
-        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(worst_setup_bucket), digits=1, strip_zero=True)}")
-    lines.append("❌ чаще давал слабое продолжение")
-    lines.append("🛠 требует усиления логики trigger-фильтра" if worst_setup_key == "normal_pending_trigger" else "🛠 требует доработки логики фильтра")
+        for item in _daily_report_worst_setup_reasons(worst_setup_key)[:3]:
+            lines.append(f"• {item}")
+        lines.extend(["", "Итог:"])
+        lines.append(f"📈 Winrate: {_daily_report_render_winrate(worst_setup_bucket, digits=1, strip_zero=True)}")
+        lines.append("❌ чаще давал слабое продолжение")
+        lines.append("🛠 требует усиления логики trigger-фильтра" if worst_setup_key == "normal_pending_trigger" else "🛠 требует доработки логики фильтра")
+    else:
+        lines.append("• нет закрытых LOSS результатов в этом окне")
+        lines.append("• худший сетап по факту результата определить нельзя")
     lines.extend(["", sep, "🔎 Почему были убытки", "", "Топ причин LOSS:"])
     if top_reasons:
         for key, value in top_reasons:
@@ -11599,8 +11737,18 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         f"TP1 protection quality: {str(filter_scores.get('tp1')) + '%' if filter_scores.get('tp1') is not None else '—'}",
         "",
         "Вывод:",
-        f"самая слабая часть сейчас — {'retest логика для LONG и слабый post-entry follow-through' if weakest_filter_key == 'retest' else weakest_filter_label}",
-        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
+    ])
+    if _daily_report_resolved_count(overall) > 0:
+        lines.extend([
+            f"самая слабая часть сейчас — {'retest логика для LONG и слабый post-entry follow-through' if weakest_filter_key == 'retest' else weakest_filter_label}",
+            f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
+        ])
+    else:
+        lines.extend([
+            "закрытых WIN/LOSS/BE/CLOSED результатов пока нет",
+            "оценки фильтров выше считаются только по входным данным, без фактического исхода сделок",
+        ])
+    lines.extend([
         "",
         sep,
         "🤖 Что улучшить боту на завтра",
@@ -11619,30 +11767,46 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     lines.extend(improve_lines[:7])
 
     lines.extend(["", sep, "📅 Рекомендация на следующий день", "", "Фокус бота:"])
-    focus_lines = ['сильные SHORT по тренду', 'liquidity reclaim и сильный breakout', 'сигналы с хорошим объёмом и подтверждённым импульсом']
-    for item in focus_lines[:3]:
+    for item in (focus_lines or ["дождаться закрытия ACTIVE/TP1 сигналов перед оценкой результата"])[:3]:
         lines.append(f"• {item}")
     lines.extend(["", "Осторожность:"])
-    caution_lines = ['zone_retest LONG', 'слабый объём на входе', 'входы без continuation после активации', 'сделки с RR ниже 1.90 в SPOT']
-    for item in caution_lines[:4]:
+    for item in (caution_lines or ["не делать выводы по winrate/PnL без закрытых сделок"])[:4]:
         lines.append(f"• {item}")
 
-    lines.extend(["", sep, "🏁 Финальный вывод", "", f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}", "", "Лучше всего отработали:"])
-    if market_best:
-        lines.append(f"• {market_best}")
-    if side_best:
-        lines.append(f"• {side_best}")
-    if best_setup_key:
-        lines.append(f"• {best_setup_key}")
-    lines.append('• breakout с подтверждённым объёмом')
+    resolved_total = _daily_report_resolved_count(overall)
+    no_result_total = _daily_report_no_result_count(overall)
+    if resolved_total > 0:
+        final_title = f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}"
+    else:
+        final_title = f"За период нет закрытых результатов. PnL по закрытым: {_report_pnl_pct(overall_pnl)}"
+    lines.extend(["", sep, "🏁 Финальный вывод", "", final_title, f"⏳ Без результата осталось: {no_result_total}", "", "Лучше всего отработали:"])
+    if market_best or side_best or best_setup_key:
+        if market_best:
+            lines.append(f"• {market_best}")
+        if side_best:
+            lines.append(f"• {side_best}")
+        if best_setup_key:
+            lines.append(f"• {best_setup_key}")
+    else:
+        lines.append('• — нет закрытых результатов для честной оценки')
     lines.extend(["", "Требуют доработки:"])
     if worst_setup_key:
         lines.append(f"• {worst_setup_key} LONG" if worst_setup_key == 'zone_retest' else f"• {worst_setup_key}")
-    lines.append('• RR filter в SPOT')
-    lines.append('• MACD momentum filter')
-    lines.append('• TP1 protection')
-    lines.append('• retest quality')
-    lines.extend(["", "Итоговая оценка дня бота:", f"⭐ {final_score} / 10"])
+    else:
+        lines.append('• — нет LOSS для точного разбора слабого сетапа')
+    if filter_scores.get('rr') is not None:
+        lines.append('• RR filter в SPOT')
+    if filter_scores.get('macd') is not None:
+        lines.append('• MACD momentum filter')
+    if filter_scores.get('tp1') is not None:
+        lines.append('• TP1 protection')
+    if filter_scores.get('retest') is not None:
+        lines.append('• retest quality')
+    lines.extend(["", "Итоговая оценка дня бота:"])
+    if resolved_total > 0:
+        lines.append(f"⭐ {final_score} / 10")
+    else:
+        lines.append("⭐ — / 10 (нет закрытых результатов)")
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
