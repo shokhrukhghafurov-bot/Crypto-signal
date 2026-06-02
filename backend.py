@@ -40177,3 +40177,427 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
 # --- END AUTOTRADE ANOMALY WATCHDOG PATCH ---
 
 
+
+
+# ============================================================================
+# USER-REVIEWED SIGNAL QUALITY GATE v1
+# -----------------------------------------------------------------------------
+# This gate was added after manual review of WIN/LOSS screenshots.
+# It does NOT remove any of the 11 setup engines. It sits after setup detection
+# and before Telegram/autotrade broadcast, so all setups must pass the same
+# execution-quality filter:
+#   - no late LONG after pump into resistance;
+#   - no late SHORT after dump into support;
+#   - no weak RR / TP1-only signals as normal signals;
+#   - no Structure pending trigger without fresh continuation when price is in a bad location;
+#   - BTC leader is used as context: it can support clean SHORT continuation, not blindly block it.
+# ============================================================================
+
+def _sqg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on", "y")
+    except Exception:
+        return bool(default)
+
+
+def _sqg_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        val = float(raw)
+        if math.isfinite(val):
+            return float(val)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _sqg_to_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _sqg_clean_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        # Normalize common exchange column variants.
+        rename = {}
+        for src, dst in (("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"), ("v", "volume")):
+            if src in d.columns and dst not in d.columns:
+                rename[src] = dst
+        if rename:
+            d = d.rename(columns=rename)
+        need = ["open", "high", "low", "close"]
+        if any(c not in d.columns for c in need):
+            return pd.DataFrame()
+        for c in need + (["volume"] if "volume" in d.columns else []):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=need).reset_index(drop=True)
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+def _sqg_atr(df: pd.DataFrame, period: int = 14) -> float:
+    try:
+        d = _sqg_clean_df(df)
+        if len(d) < 3:
+            return 0.0
+        h = d["high"].astype(float)
+        l = d["low"].astype(float)
+        c = d["close"].astype(float)
+        prev_c = c.shift(1)
+        tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+        val = float(tr.tail(max(2, int(period))).mean())
+        return val if math.isfinite(val) and val > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _sqg_snapshot(df: pd.DataFrame, *, entry: float = 0.0, lookback: int = 48) -> dict:
+    d = _sqg_clean_df(df)
+    if d.empty or len(d) < 8:
+        return {"ok": False}
+    try:
+        atr = _sqg_atr(d, 14)
+        if atr <= 0:
+            atr = max(float((d["high"] - d["low"]).tail(14).mean() or 0.0), float(d["close"].iloc[-1]) * 0.003)
+        last = d.iloc[-1]
+        close = float(last["close"])
+        open_ = float(last["open"])
+        high = float(last["high"])
+        low = float(last["low"])
+        body = abs(close - open_)
+        rng = max(high - low, 1e-12)
+        close_pos = (close - low) / rng
+        body_atr = body / max(atr, 1e-12)
+        signed_body_atr = ((close - open_) / max(atr, 1e-12))
+        tail = d.tail(max(8, int(lookback)))
+        hi = float(tail["high"].max())
+        lo = float(tail["low"].min())
+        pos = 0.50 if hi <= lo else ((float(entry or close) - lo) / max(hi - lo, 1e-12))
+        pos = max(0.0, min(1.0, float(pos)))
+        recent_high = float(tail["high"].max())
+        recent_low = float(tail["low"].min())
+        recent_high_idx = int(tail["high"].idxmax())
+        recent_low_idx = int(tail["low"].idxmin())
+        bars_from_high = int(len(d) - 1 - recent_high_idx)
+        bars_from_low = int(len(d) - 1 - recent_low_idx)
+        two_green = bool(len(d) >= 2 and (d["close"].iloc[-1] > d["open"].iloc[-1]) and (d["close"].iloc[-2] > d["open"].iloc[-2]))
+        two_red = bool(len(d) >= 2 and (d["close"].iloc[-1] < d["open"].iloc[-1]) and (d["close"].iloc[-2] < d["open"].iloc[-2]))
+        # Very simple local structure proxies: enough for a final execution gate.
+        prev = d.iloc[-6:-1] if len(d) >= 7 else d.iloc[:-1]
+        lower_highs = False
+        higher_lows = False
+        try:
+            lower_highs = bool(len(prev) >= 3 and float(prev["high"].iloc[-1]) <= float(prev["high"].iloc[-3]) and float(d["high"].iloc[-1]) <= max(float(prev["high"].iloc[-1]), float(prev["high"].iloc[-2])))
+            higher_lows = bool(len(prev) >= 3 and float(prev["low"].iloc[-1]) >= float(prev["low"].iloc[-3]) and float(d["low"].iloc[-1]) >= min(float(prev["low"].iloc[-1]), float(prev["low"].iloc[-2])))
+        except Exception:
+            pass
+        vol_x = 0.0
+        if "volume" in d.columns:
+            try:
+                v_now = float(d["volume"].iloc[-1] or 0.0)
+                v_avg = float(d["volume"].tail(30).iloc[:-1].mean() or 0.0)
+                if v_avg > 0:
+                    vol_x = v_now / v_avg
+            except Exception:
+                vol_x = 0.0
+        return {
+            "ok": True,
+            "close": close,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "atr": float(atr),
+            "body_atr": float(body_atr),
+            "signed_body_atr": float(signed_body_atr),
+            "close_pos": float(close_pos),
+            "range_pos": float(pos),
+            "recent_high": float(recent_high),
+            "recent_low": float(recent_low),
+            "bars_from_high": int(bars_from_high),
+            "bars_from_low": int(bars_from_low),
+            "two_green": bool(two_green),
+            "two_red": bool(two_red),
+            "lower_highs": bool(lower_highs),
+            "higher_lows": bool(higher_lows),
+            "vol_x": float(vol_x),
+            "df": d,
+        }
+    except Exception:
+        return {"ok": False}
+
+
+def _sqg_nearest_levels(df_list: list[pd.DataFrame], entry: float) -> tuple[float, float]:
+    """Return (nearest_support_below_entry, nearest_resistance_above_entry)."""
+    supports: list[float] = []
+    resistances: list[float] = []
+    try:
+        for df in df_list:
+            d = _sqg_clean_df(df)
+            if d.empty:
+                continue
+            tail = d.tail(80)
+            for x in tail["low"].astype(float).tolist():
+                if x < entry:
+                    supports.append(float(x))
+            for x in tail["high"].astype(float).tolist():
+                if x > entry:
+                    resistances.append(float(x))
+    except Exception:
+        pass
+    sup = max(supports) if supports else 0.0
+    res = min(resistances) if resistances else 0.0
+    return float(sup), float(res)
+
+
+def _sqg_btc_bias_from_frames(df15: pd.DataFrame | None, df30: pd.DataFrame | None) -> dict:
+    try:
+        s15 = _sqg_snapshot(df15, lookback=48)
+        s30 = _sqg_snapshot(df30, lookback=48)
+        if not s15.get("ok") or not s30.get("ok"):
+            return {"ok": False, "bull": False, "bear": False}
+        def _ema(vals, n):
+            try:
+                return pd.Series(vals).ewm(span=n, adjust=False).mean().iloc[-1]
+            except Exception:
+                return None
+        d15 = s15.get("df")
+        d30 = s30.get("df")
+        c15 = list(d15["close"].astype(float).tail(80)) if isinstance(d15, pd.DataFrame) else []
+        c30 = list(d30["close"].astype(float).tail(80)) if isinstance(d30, pd.DataFrame) else []
+        ema20_15 = _ema(c15, 20)
+        ema50_15 = _ema(c15, 50)
+        ema20_30 = _ema(c30, 20)
+        ema50_30 = _ema(c30, 50)
+        close15 = float(s15.get("close") or 0.0)
+        close30 = float(s30.get("close") or 0.0)
+        ret15 = (close15 / max(float(c15[-12]) if len(c15) >= 12 else close15, 1e-12) - 1.0) if c15 else 0.0
+        ret30 = (close30 / max(float(c30[-8]) if len(c30) >= 8 else close30, 1e-12) - 1.0) if c30 else 0.0
+        bear = bool(
+            ema20_15 is not None and ema50_15 is not None and ema20_30 is not None and ema50_30 is not None
+            and close15 < float(ema20_15) <= float(ema50_15)
+            and close30 < float(ema20_30) <= float(ema50_30)
+            and (ret15 < -0.002 or ret30 < -0.003)
+        )
+        bull = bool(
+            ema20_15 is not None and ema50_15 is not None and ema20_30 is not None and ema50_30 is not None
+            and close15 > float(ema20_15) >= float(ema50_15)
+            and close30 > float(ema20_30) >= float(ema50_30)
+            and (ret15 > 0.002 or ret30 > 0.003)
+        )
+        return {"ok": True, "bull": bool(bull), "bear": bool(bear), "ret15": float(ret15), "ret30": float(ret30)}
+    except Exception:
+        return {"ok": False, "bull": False, "bear": False}
+
+
+def _sqg_append_note(sig: Signal, note: str) -> None:
+    try:
+        old = str(getattr(sig, "risk_note", "") or "").strip()
+        if note and note not in old:
+            setattr(sig, "risk_note", (old + "\n" + note).strip())
+    except Exception:
+        pass
+
+
+async def _backend_signal_quality_gate(self: "Backend", sig: Signal | None) -> tuple[bool, str, dict]:
+    """Final user-reviewed quality gate before a signal is broadcast.
+
+    Returns (ok, reason, meta).  Reason is machine-readable and is logged by bot.py.
+    The default is strict enough to reduce bad signals from the reviewed report, but
+    it can be tuned with MID_SIGNAL_QUALITY_* env variables without changing code.
+    """
+    meta: dict[str, object] = {}
+    try:
+        if sig is None:
+            return (False, "quality_missing_signal", meta)
+        if not _sqg_env_bool("MID_SIGNAL_QUALITY_GATE_ENABLED", True):
+            return (True, "disabled", meta)
+
+        side = str(getattr(sig, "direction", "") or "").upper().strip()
+        market = str(getattr(sig, "market", "") or "FUTURES").upper().strip()
+        symbol = str(getattr(sig, "symbol", "") or "").upper().strip()
+        if side not in ("LONG", "SHORT") or not symbol:
+            return (False, "quality_bad_signal_identity", meta)
+        entry = _sqg_to_float(getattr(sig, "entry", 0.0), 0.0)
+        sl = _sqg_to_float(getattr(sig, "sl", 0.0), 0.0)
+        tp1 = _sqg_to_float(getattr(sig, "tp1", 0.0), 0.0)
+        tp2 = _sqg_to_float(getattr(sig, "tp2", 0.0), 0.0)
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return (False, "quality_bad_levels", meta)
+        ok_levels, levels_reason = _signal_levels_sanity_gate(sig)
+        if not ok_levels:
+            return (False, f"quality_bad_levels:{levels_reason}", meta)
+
+        risk = abs(entry - sl)
+        reward1 = abs(tp1 - entry)
+        rr1 = reward1 / max(risk, 1e-12)
+        meta.update({"rr1": float(rr1), "entry": float(entry), "tp1": float(tp1), "sl": float(sl)})
+
+        min_rr_fut = _sqg_env_float("MID_SIGNAL_QUALITY_MIN_RR_FUTURES", 1.30)
+        min_rr_spot_long = _sqg_env_float("MID_SIGNAL_QUALITY_MIN_RR_SPOT_LONG", 1.80)
+        min_rr_spot_short = _sqg_env_float("MID_SIGNAL_QUALITY_MIN_RR_SPOT_SHORT", 1.40)
+        min_rr = min_rr_fut if market == "FUTURES" else (min_rr_spot_long if side == "LONG" else min_rr_spot_short)
+        # TP2 runners with decent TP1 geometry may pass slightly below the normal futures min.
+        runner_min = _sqg_env_float("MID_SIGNAL_QUALITY_TP2_RUNNER_MIN_RR1", 1.25)
+        if rr1 < min_rr and not (market == "FUTURES" and tp2 > 0 and rr1 >= runner_min):
+            return (False, f"quality_rr_too_low:{rr1:.2f}<{min_rr:.2f}", meta)
+
+        try:
+            df5 = await self.load_candles(symbol, "5m", market=market, limit=160)
+        except Exception:
+            df5 = pd.DataFrame()
+        try:
+            df15 = await self.load_candles(symbol, "15m", market=market, limit=180)
+        except Exception:
+            df15 = pd.DataFrame()
+
+        s5 = _sqg_snapshot(df5, entry=entry, lookback=48)
+        s15 = _sqg_snapshot(df15, entry=entry, lookback=48)
+        if not s5.get("ok") and not s15.get("ok"):
+            if _sqg_env_bool("MID_SIGNAL_QUALITY_FAIL_CLOSED_NO_CANDLES", False):
+                return (False, "quality_no_candles", meta)
+            return (True, "quality_no_candles_fail_open", meta)
+
+        # Prefer 5m for trigger quality, 15m for location/context.
+        snap_t = s5 if s5.get("ok") else s15
+        snap_c = s15 if s15.get("ok") else s5
+        atr = max(_sqg_to_float(snap_t.get("atr"), 0.0), _sqg_to_float(snap_c.get("atr"), 0.0), risk)
+        close = _sqg_to_float(snap_t.get("close"), entry)
+        range_pos = _sqg_to_float(snap_c.get("range_pos"), _sqg_to_float(snap_t.get("range_pos"), 0.5))
+        body_atr = max(_sqg_to_float(snap_t.get("body_atr"), 0.0), _sqg_to_float(snap_c.get("body_atr"), 0.0))
+        close_pos = _sqg_to_float(snap_t.get("close_pos"), 0.5)
+        recent_high = max(_sqg_to_float(snap_c.get("recent_high"), 0.0), _sqg_to_float(snap_t.get("recent_high"), 0.0))
+        recent_low_vals = [v for v in (_sqg_to_float(snap_c.get("recent_low"), 0.0), _sqg_to_float(snap_t.get("recent_low"), 0.0)) if v > 0]
+        recent_low = min(recent_low_vals) if recent_low_vals else 0.0
+        vol_x = max(_sqg_to_float(snap_t.get("vol_x"), 0.0), _sqg_to_float(snap_c.get("vol_x"), 0.0))
+        meta.update({
+            "range_pos": float(range_pos), "body_atr": float(body_atr), "close_pos": float(close_pos),
+            "atr": float(atr), "recent_high": float(recent_high), "recent_low": float(recent_low), "vol_x": float(vol_x),
+        })
+
+        fresh_body_min = _sqg_env_float("MID_SIGNAL_QUALITY_FRESH_BODY_ATR", 0.25)
+        fresh_bull = bool(
+            (_sqg_to_float(snap_t.get("signed_body_atr"), 0.0) >= fresh_body_min and _sqg_to_float(snap_t.get("close_pos"), 0.5) >= 0.62)
+            or (_sqg_to_float(snap_c.get("signed_body_atr"), 0.0) >= fresh_body_min and _sqg_to_float(snap_c.get("close_pos"), 0.5) >= 0.62)
+            or (bool(snap_t.get("two_green")) and bool(snap_t.get("higher_lows")) and _sqg_to_float(snap_t.get("close_pos"), 0.5) >= 0.58)
+        )
+        fresh_bear = bool(
+            (_sqg_to_float(snap_t.get("signed_body_atr"), 0.0) <= -fresh_body_min and _sqg_to_float(snap_t.get("close_pos"), 0.5) <= 0.38)
+            or (_sqg_to_float(snap_c.get("signed_body_atr"), 0.0) <= -fresh_body_min and _sqg_to_float(snap_c.get("close_pos"), 0.5) <= 0.38)
+            or (bool(snap_t.get("two_red")) and bool(snap_t.get("lower_highs")) and _sqg_to_float(snap_t.get("close_pos"), 0.5) <= 0.42)
+        )
+        meta.update({"fresh_bull": bool(fresh_bull), "fresh_bear": bool(fresh_bear)})
+
+        support, resistance = _sqg_nearest_levels([df5, df15], entry)
+        pad = max(float(atr) * 0.08, float(entry) * 0.0006)
+        support_before_tp1 = bool(side == "SHORT" and support > 0 and tp1 < support < entry)
+        resistance_before_tp1 = bool(side == "LONG" and resistance > 0 and entry < resistance < tp1)
+        short_accept_below_support = bool(support > 0 and close < (support - pad))
+        long_accept_above_resistance = bool(resistance > 0 and close > (resistance + pad))
+        meta.update({
+            "nearest_support": float(support or 0.0), "nearest_resistance": float(resistance or 0.0),
+            "support_before_tp1": bool(support_before_tp1), "resistance_before_tp1": bool(resistance_before_tp1),
+            "accept_below_support": bool(short_accept_below_support), "accept_above_resistance": bool(long_accept_above_resistance),
+        })
+
+        btc = {"ok": False, "bear": False, "bull": False}
+        if _sqg_env_bool("MID_SIGNAL_QUALITY_USE_BTC_CONTEXT", True) and symbol != "BTCUSDT":
+            try:
+                btc_mkt = market if _sqg_env_bool("MID_SIGNAL_QUALITY_BTC_SAME_MARKET", True) else "SPOT"
+                btc15 = await self.load_candles("BTCUSDT", "15m", market=btc_mkt, limit=160)
+                btc30 = await self.load_candles("BTCUSDT", "30m", market=btc_mkt, limit=160)
+                btc = _sqg_btc_bias_from_frames(btc15, btc30)
+            except Exception:
+                btc = {"ok": False, "bear": False, "bull": False}
+        btc_bear = bool(btc.get("bear"))
+        btc_bull = bool(btc.get("bull"))
+        meta.update({"btc_bear": bool(btc_bear), "btc_bull": bool(btc_bull)})
+
+        late_atr_min = _sqg_env_float("MID_SIGNAL_QUALITY_LATE_MOVE_ATR", 1.35)
+        late_long_from_low = ((entry - recent_low) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+        late_short_from_high = ((recent_high - entry) / max(atr, 1e-12)) if recent_high > 0 and recent_high > entry else 0.0
+        late_long_after_pump = bool(late_long_from_low >= late_atr_min and range_pos >= _sqg_env_float("MID_SIGNAL_QUALITY_LATE_LONG_RANGE_POS", 0.60))
+        late_short_after_dump = bool(late_short_from_high >= late_atr_min and range_pos <= _sqg_env_float("MID_SIGNAL_QUALITY_LATE_SHORT_RANGE_POS", 0.40))
+        meta.update({"late_long_atr": float(late_long_from_low), "late_short_atr": float(late_short_from_high)})
+
+        # Good LONG exception: reclaim after selloff / held reclaimed zone. This preserves
+        # the NIGHT-style winner and does not protect vertical pump buys like SUSHI/AI/LUNC.
+        reclaim_long = bool(
+            side == "LONG"
+            and fresh_bull
+            and range_pos >= 0.42
+            and not resistance_before_tp1
+            and (recent_low > 0 and (entry - recent_low) / max(atr, 1e-12) >= 0.85)
+            and close >= entry - pad
+        )
+        # Good SHORT exception: BTC bearish + clean continuation. This preserves AAVE/SOL/SUI/UNI
+        # style continuation shorts and still blocks shorts directly into support.
+        clean_btc_short_continuation = bool(
+            side == "SHORT"
+            and btc_bear
+            and not support_before_tp1
+            and range_pos >= 0.38
+            and rr1 >= _sqg_env_float("MID_SIGNAL_QUALITY_BTC_SHORT_MIN_RR", 1.45)
+            and (fresh_bear or body_atr >= 0.18 or bool(snap_t.get("lower_highs")))
+        )
+        meta.update({"reclaim_long": bool(reclaim_long), "clean_btc_short": bool(clean_btc_short_continuation)})
+
+        if side == "LONG":
+            if market == "SPOT" and btc_bear and not reclaim_long:
+                return (False, "quality_spot_long_against_btc_bear", meta)
+            if late_long_after_pump and not reclaim_long:
+                if resistance_before_tp1 or not fresh_bull or not long_accept_above_resistance or rr1 < 2.50:
+                    return (False, "quality_late_long_after_pump_no_acceptance", meta)
+            if resistance_before_tp1 and not long_accept_above_resistance and not reclaim_long:
+                return (False, "quality_long_tp1_behind_resistance", meta)
+            if not fresh_bull and not reclaim_long:
+                return (False, "quality_long_no_fresh_bullish_expansion", meta)
+            if risk < max(atr * 0.45, entry * 0.0020) and late_long_after_pump and not reclaim_long:
+                return (False, "quality_long_sl_inside_pullback", meta)
+            if btc_bull or reclaim_long or fresh_bull:
+                _sqg_append_note(sig, f"✅ Smart Quality Gate: PASS LONG rr1={rr1:.2f} reclaim={int(reclaim_long)}")
+                return (True, "pass", meta)
+            return (False, "quality_long_context_not_strong", meta)
+
+        # SHORT rules.
+        if btc_bull and not fresh_bear:
+            return (False, "quality_short_against_btc_bull", meta)
+        if late_short_after_dump and not clean_btc_short_continuation:
+            if support_before_tp1 or not fresh_bear or range_pos <= 0.35:
+                return (False, "quality_late_short_after_dump_into_support", meta)
+        if support_before_tp1 and not short_accept_below_support and not clean_btc_short_continuation:
+            return (False, "quality_short_tp1_behind_support", meta)
+        if range_pos <= _sqg_env_float("MID_SIGNAL_QUALITY_SHORT_LOW_RANGE_BLOCK", 0.33) and not fresh_bear and not clean_btc_short_continuation:
+            return (False, "quality_short_near_range_low_without_breakdown", meta)
+        if not fresh_bear and not clean_btc_short_continuation:
+            return (False, "quality_short_no_fresh_bearish_expansion", meta)
+        _sqg_append_note(sig, f"✅ Smart Quality Gate: PASS SHORT rr1={rr1:.2f} btc_bear={int(btc_bear)}")
+        return (True, "pass", meta)
+    except Exception as e:
+        try:
+            meta["error"] = f"{type(e).__name__}:{e}"
+        except Exception:
+            pass
+        if _sqg_env_bool("MID_SIGNAL_QUALITY_FAIL_CLOSED_ON_ERROR", False):
+            return (False, "quality_gate_error", meta)
+        return (True, "quality_gate_error_fail_open", meta)
+
+
+try:
+    Backend.signal_quality_gate = _backend_signal_quality_gate  # type: ignore[attr-defined]
+except Exception:
+    pass
+# --- END USER-REVIEWED SIGNAL QUALITY GATE v1 ---
