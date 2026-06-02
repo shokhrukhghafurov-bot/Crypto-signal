@@ -1514,6 +1514,11 @@ ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
 _SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
 _SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
 
+# Cross-market duplicate protection: if the bot already sent SUSHI LONG on SPOT,
+# do not send the same SUSHI LONG again on FUTURES a few minutes later.
+_QUALITY_SYMBOL_SIDE_CACHE: Dict[str, float] = {}
+
+
 # ---------------- bot statistics ----------------
 # NOTE: Statistics are stored ONLY in Postgres (signal_sent_events + signal_tracks).
 
@@ -12124,8 +12129,50 @@ async def broadcast_signal(sig: Signal) -> None:
         # best effort: if settings table not ready, don't block
         pass
 
+    # User-reviewed quality gate: keep all 11 setup engines, but block weak execution.
+    # This is the final guard built from the manual report: no late LONG after pump,
+    # no late SHORT into support, no low-RR normal signals, no duplicate same-symbol direction.
+    try:
+        if str(os.getenv("SIGNAL_QUALITY_GATE_ENABLED", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            quality_fn = getattr(backend, "signal_quality_gate", None)
+            if callable(quality_fn):
+                _q_ok, _q_reason, _q_meta = await quality_fn(sig)
+                if not _q_ok:
+                    logger.info(
+                        "Skip signal by Smart Quality Gate: market=%s symbol=%s dir=%s reason=%s meta=%s",
+                        getattr(sig, "market", "-"), getattr(sig, "symbol", "-"), getattr(sig, "direction", "-"), _q_reason, _q_meta,
+                    )
+                    return
+    except Exception as e:
+        # Fail-open by default so a temporary candle-source issue does not kill the bot.
+        if str(os.getenv("SIGNAL_QUALITY_GATE_FAIL_CLOSED", "0") or "0").strip().lower() in ("1", "true", "yes", "on"):
+            logger.info("Skip signal because Smart Quality Gate errored: %s", e)
+            return
+        logger.warning("Smart Quality Gate error, fail-open: %r", e)
+
+    # Cross-market duplicate same-symbol/same-direction guard.
+    try:
+        _dup_hours = float(os.getenv("SIGNAL_DUPLICATE_SYMBOL_SIDE_HOURS", "6") or 6)
+    except Exception:
+        _dup_hours = 6.0
+    try:
+        if _dup_hours > 0:
+            _now_dup = time.time()
+            _ttl_dup = max(60.0, _dup_hours * 3600.0)
+            for _k, _ts in list(_QUALITY_SYMBOL_SIDE_CACHE.items()):
+                if _now_dup - float(_ts) > _ttl_dup:
+                    _QUALITY_SYMBOL_SIDE_CACHE.pop(_k, None)
+            _sym_dup = str(getattr(sig, "symbol", "") or "").upper().strip()
+            _side_dup = _normalize_side_for_stats(getattr(sig, "direction", ""))
+            _dup_key = f"{_sym_dup}|{_side_dup}"
+            if _sym_dup and _dup_key in _QUALITY_SYMBOL_SIDE_CACHE:
+                logger.info("Skip duplicate same-symbol direction across markets: %s", _dup_key)
+                return
+    except Exception:
+        _dup_key = ""
+
     # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
-    import time, hashlib
+    import hashlib
     now = time.time()
     for k, ts in list(_SENT_SIG_CACHE.items()):
         if now - ts > _SENT_SIG_TTL_SEC:
@@ -12214,6 +12261,11 @@ async def broadcast_signal(sig: Signal) -> None:
                 pass
 
     _SENT_SIG_CACHE[sig_key] = now
+    try:
+        if '_dup_key' in locals() and _dup_key:
+            _QUALITY_SYMBOL_SIDE_CACHE[_dup_key] = now
+    except Exception:
+        pass
 
     # Assign a globally unique signal_id from DB sequence (survives restarts).
     # IMPORTANT:
