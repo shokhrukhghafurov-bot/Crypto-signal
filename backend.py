@@ -1163,6 +1163,53 @@ def get_autotrade_master_key() -> str:
 
 logger = logging.getLogger("crypto-signal")
 
+# --- Resilient DB outage/backoff helpers ---------------------------------
+# Used by long-running backend loops. When PostgreSQL is temporarily
+# unreachable, retry with exponential backoff instead of spamming asyncpg
+# connection tracebacks every tick.
+_DB_LOOP_ERROR_STREAKS: dict[str, int] = {}
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+            return True
+        name = type(cur).__name__.lower()
+        msg = str(cur).lower()
+        if (
+            "connection" in name
+            or "cannotconnect" in name
+            or "too many connections" in msg
+            or ("pool" in msg and "timeout" in msg)
+            or "timeout" in name
+        ):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+def _reset_db_backoff(loop_name: str) -> None:
+    _DB_LOOP_ERROR_STREAKS.pop(str(loop_name), None)
+
+async def _sleep_after_db_outage(loop_name: str, exc: BaseException, *, base_sec: float | None = None, max_sec: float | None = None) -> None:
+    key = str(loop_name)
+    try:
+        base = float(base_sec if base_sec is not None else os.getenv("DB_TRANSIENT_BACKOFF_BASE_SEC", "5") or 5)
+    except Exception:
+        base = 5.0
+    try:
+        cap = float(max_sec if max_sec is not None else os.getenv("DB_TRANSIENT_BACKOFF_MAX_SEC", "120") or 120)
+    except Exception:
+        cap = 120.0
+    streak = int(_DB_LOOP_ERROR_STREAKS.get(key, 0)) + 1
+    _DB_LOOP_ERROR_STREAKS[key] = streak
+    delay = min(cap, max(1.0, base) * (2 ** min(streak - 1, 5)))
+    delay += random.uniform(0.0, min(3.0, delay * 0.15))
+    logger.warning("%s: database is temporarily unavailable (%s). Retry in %.1fs", key, type(exc).__name__, delay)
+    await asyncio.sleep(delay)
+# --------------------------------------------------------------------------
+
 
 def _smart_log_exception(context: str, exc: Exception, *, level: str = "warning") -> None:
     """Log smart-manager exceptions instead of silently swallowing them."""
@@ -23642,7 +23689,11 @@ class Backend:
                 pass
             try:
                 rows = await db_store.list_active_trades(limit=500)
-            except Exception:
+                _reset_db_backoff("track_loop")
+            except Exception as e:
+                if _is_transient_db_error(e):
+                    await _sleep_after_db_outage("track_loop", e, base_sec=max(5.0, float(TRACK_INTERVAL_SECONDS)), max_sec=180)
+                    continue
                 logger.exception("track_loop: failed to load active trades from DB")
                 rows = []
 
