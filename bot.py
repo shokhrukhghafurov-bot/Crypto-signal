@@ -1279,6 +1279,55 @@ LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 pool: asyncpg.Pool | None = None
 
+# --- Resilient DB outage/backoff helpers ---------------------------------
+# Railway/Postgres can be temporarily unreachable during deploys, restarts,
+# plan sleeps, DNS/network hiccups or connection-limit pressure. Without a
+# backoff the background loops log a full traceback every tick and keep trying
+# to open new asyncpg connections. These helpers keep the bot alive and retry
+# calmly until the DB becomes reachable again.
+_DB_LOOP_ERROR_STREAKS: dict[str, int] = {}
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+            return True
+        name = type(cur).__name__.lower()
+        msg = str(cur).lower()
+        if (
+            "connection" in name
+            or "cannotconnect" in name
+            or "too many connections" in msg
+            or "pool" in msg and "timeout" in msg
+            or "timeout" in name
+        ):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+def _reset_db_backoff(loop_name: str) -> None:
+    _DB_LOOP_ERROR_STREAKS.pop(str(loop_name), None)
+
+async def _sleep_after_db_outage(loop_name: str, exc: BaseException, *, base_sec: float | None = None, max_sec: float | None = None) -> None:
+    key = str(loop_name)
+    try:
+        base = float(base_sec if base_sec is not None else os.getenv("DB_TRANSIENT_BACKOFF_BASE_SEC", "5") or 5)
+    except Exception:
+        base = 5.0
+    try:
+        cap = float(max_sec if max_sec is not None else os.getenv("DB_TRANSIENT_BACKOFF_MAX_SEC", "120") or 120)
+    except Exception:
+        cap = 120.0
+    streak = int(_DB_LOOP_ERROR_STREAKS.get(key, 0)) + 1
+    _DB_LOOP_ERROR_STREAKS[key] = streak
+    delay = min(cap, max(1.0, base) * (2 ** min(streak - 1, 5)))
+    delay += random.uniform(0.0, min(3.0, delay * 0.15))
+    logger.warning("%s: database is temporarily unavailable (%s). Retry in %.1fs", key, type(exc).__name__, delay)
+    await asyncio.sleep(delay)
+# --------------------------------------------------------------------------
+
 LANG_FILE = Path("langs.json")
 LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
 
@@ -1785,14 +1834,14 @@ async def init_db() -> None:
     # Pool sizing must be defined regardless of DATABASE_URL presence.
     # (Previously min_size was accidentally placed after a `return`, causing
     # UnboundLocalError when DATABASE_URL is set.)
-    min_size = int(os.getenv("DB_POOL_MIN", "1"))
-    max_size = int(os.getenv("DB_POOL_MAX", "10"))
+    min_size = int(os.getenv("DB_POOL_MIN", "0"))
+    max_size = int(os.getenv("DB_POOL_MAX", "6"))
     if not DATABASE_URL:
         # Allow running without Postgres locally, but notifications will be disabled.
         pool = None
         return
     acquire_timeout = float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25"))
-    command_timeout = float(os.getenv("DB_COMMAND_TIMEOUT_SEC", "30"))
+    command_timeout = float(os.getenv("DB_COMMAND_TIMEOUT_SEC", "45"))
     init_retries = int(os.getenv("DB_INIT_RETRIES", "8"))
     base_sleep = float(os.getenv("DB_INIT_RETRY_BASE_SEC", "0.8"))
     last_err = None
@@ -1804,6 +1853,7 @@ async def init_db() -> None:
                 max_size=max_size,
                 timeout=acquire_timeout,
                 command_timeout=command_timeout,
+                max_inactive_connection_lifetime=float(os.getenv("DB_MAX_INACTIVE_CONNECTION_LIFETIME_SEC", "300") or 300),
             )
             break
         except Exception as e:
@@ -11896,7 +11946,11 @@ async def daily_signal_report_loop() -> None:
                     "tz": TZ_NAME,
                 })
                 logger.info("[report-bot] daily signal report sent for %s", report_key)
-        except Exception:
+            _reset_db_backoff("daily-signal-report")
+        except Exception as e:
+            if _is_transient_db_error(e):
+                await _sleep_after_db_outage("daily-signal-report", e, base_sec=10, max_sec=180)
+                continue
             logger.exception("[report-bot] daily signal report loop error")
         await asyncio.sleep(30)
 
@@ -16034,7 +16088,12 @@ async def signal_outcome_loop() -> None:
                     len(rows), processed, price_miss, tp1_marked, closed_win, closed_loss, closed_be, closed_timeout,
                 )
 
-        except Exception:
+            _reset_db_backoff("signal-outcome")
+
+        except Exception as e:
+            if _is_transient_db_error(e):
+                await _sleep_after_db_outage("signal-outcome", e, base_sec=max(5.0, float(_SIG_WATCH_INTERVAL_SEC)), max_sec=180)
+                continue
             logger.exception("signal_outcome_loop error")
 
         await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
